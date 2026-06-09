@@ -1390,19 +1390,22 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
                 // hop back to MainActor.
                 let nsError = error as NSError
                 await self?.applyLoadFailure(error: nsError,
+                                             fileURL: url,
                                              silentOnFailure: silentOnFailure)
             }
         }
     }
 
     private func applyLoadedMarkdown(_ text: String, fileURL: URL) {
+        guard currentFileURL == fileURL else { return }
         currentMarkdown = text
         refreshOpenInLLMItem()
         markdownDocument?.replaceContents(markdown: text, fileURL: fileURL)
         renderCurrentDocument(text: text, fileURL: fileURL)
     }
 
-    private func applyLoadFailure(error: NSError, silentOnFailure: Bool) {
+    private func applyLoadFailure(error: NSError, fileURL: URL, silentOnFailure: Bool) {
+        guard currentFileURL == fileURL else { return }
         guard !silentOnFailure else { return }
         NSAlert(error: error).beginSheetModal(for: documentWindow)
     }

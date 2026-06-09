@@ -53,6 +53,9 @@ final class MarkdownWebView: NSView, WKNavigationDelegate {
     // Bumped on every display() call so a slower render finishing after a
     // newer one is dropped instead of clobbering the latest article.
     private var renderGeneration: UInt64 = 0
+    // Bumped on every fast-path JS swap (clear or update) so a stale
+    // evaluateJavaScript completion can't blank content after a newer load.
+    private var jsUpdateGeneration: UInt64 = 0
     // Last unzoomed document height reported by the page (CSS pixels). Cached
     // so a pageZoom change can re-fire heightDidChange with the right scale
     // without waiting for JS to post a fresh value (it won't — scrollHeight
@@ -156,7 +159,15 @@ final class MarkdownWebView: NSView, WKNavigationDelegate {
     /// `display()` still hits the fast-path.
     func clearContent() {
         guard isPageReady else { return }
-        webView.evaluateJavaScript("window.MdPreview && MdPreview.update('');") { _, _ in }
+        scheduleArticleUpdate("window.MdPreview && MdPreview.update('');")
+    }
+
+    private func scheduleArticleUpdate(_ javaScript: String) {
+        jsUpdateGeneration &+= 1
+        let generation = jsUpdateGeneration
+        webView.evaluateJavaScript(javaScript) { [weak self] _, _ in
+            guard let self, self.jsUpdateGeneration == generation else { return }
+        }
     }
 
     func display(markdown: String, assetBaseURL: URL? = nil) {
@@ -214,7 +225,7 @@ final class MarkdownWebView: NSView, WKNavigationDelegate {
         // subsequent file with any subset of renderers fast-paths into it.
         if isPageReady, let loaded = loadedFingerprint, loaded.covers(fingerprint) {
             let payload = javaScriptStringLiteral(rendered.articleHTML)
-            webView.evaluateJavaScript("window.MdPreview && MdPreview.update(\(payload));") { _, _ in }
+            scheduleArticleUpdate("window.MdPreview && MdPreview.update(\(payload));")
             return
         }
 
