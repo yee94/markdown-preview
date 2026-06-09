@@ -161,16 +161,11 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
             return
         }
 
-        // Switching to a different file blanks the preview so the previous
-        // doc doesn't linger on screen during sheet dismissal + load.
-        let isFileSwitch = currentFileURL != nil && currentFileURL != url
+        // Keep the previous doc visible until the new one loads. Cloud /
+        // network volumes often return empty reads on reload after idle.
         currentFileURL = url
-        currentMarkdown = nil
         markdownDocument?.replaceFileURL(url)
         documentWindow.title = url.lastPathComponent
-        if isFileSwitch {
-            (documentWindow.contentViewController as? MainSplitViewController)?.clearContent()
-        }
         documentWindow.makeKeyAndOrderFront(nil)
         NSApp.activate()
         NSDocumentController.shared.noteNewRecentDocumentURL(url)
@@ -1379,11 +1374,17 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
         return panel
     }
 
-    private func loadFile(at url: URL, silentOnFailure: Bool = false) {
+    private func loadFile(at url: URL, silentOnFailure: Bool = false, attempt: Int = 0) {
         Task { @concurrent [weak self] in
             do {
-                let text = try String(contentsOf: url, encoding: .utf8)
+                let text = try Self.readMarkdown(at: url)
                 await self?.applyLoadedMarkdown(text, fileURL: url)
+            } catch is TransientEmptyRead {
+                await MainActor.run {
+                    self?.handleTransientEmptyRead(at: url,
+                                                   silentOnFailure: silentOnFailure,
+                                                   attempt: attempt)
+                }
             } catch {
                 // Wrap as NSError (Sendable) so the original presentation —
                 // localizedDescription + recovery suggestion — survives the
@@ -1396,8 +1397,49 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
         }
     }
 
+    /// Cloud / network volumes (iCloud, FUSE mounts, etc.) can report a
+    /// non-zero size while transiently returning an empty `String` read.
+    private struct TransientEmptyRead: Error {}
+
+    private nonisolated static func readMarkdown(at url: URL) throws -> String {
+        let text = try String(contentsOf: url, encoding: .utf8)
+        guard text.isEmpty else { return text }
+        let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        if size > 0 { throw TransientEmptyRead() }
+        return text
+    }
+
+    private func handleTransientEmptyRead(at url: URL, silentOnFailure: Bool, attempt: Int) {
+        guard currentFileURL == url else { return }
+        // Watcher-driven reload after idle: keep showing the last good doc.
+        if silentOnFailure, let existing = currentMarkdown, !existing.isEmpty {
+            return
+        }
+        let maxAttempts = 4
+        guard attempt < maxAttempts else {
+            guard !silentOnFailure else { return }
+            let error = NSError(
+                domain: NSCocoaErrorDomain,
+                code: NSFileReadUnknownError,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Could not read the file contents. The volume may still be syncing."]
+            )
+            NSAlert(error: error).beginSheetModal(for: documentWindow)
+            return
+        }
+        let delay = 0.5 * Double(attempt + 1)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, self.currentFileURL == url else { return }
+            self.loadFile(at: url, silentOnFailure: silentOnFailure, attempt: attempt + 1)
+        }
+    }
+
     private func applyLoadedMarkdown(_ text: String, fileURL: URL) {
         guard currentFileURL == fileURL else { return }
+        // Same blip can slip through without raising; never clobber a good doc.
+        if text.isEmpty, let existing = currentMarkdown, !existing.isEmpty {
+            return
+        }
         currentMarkdown = text
         refreshOpenInLLMItem()
         markdownDocument?.replaceContents(markdown: text, fileURL: fileURL)
@@ -1476,7 +1518,11 @@ private final class FileWatcher {
                 }
                 self.reopen()
             }
-            self.scheduleChange()
+            // .revoke on cloud/network volumes fires on idle remount; reloading
+            // then often reads an empty body and blanks the preview.
+            if !event.intersection([.write, .extend, .delete, .rename]).isEmpty {
+                self.scheduleChange()
+            }
         }
         source.setCancelHandler { [weak self] in
             guard let self else { return }
