@@ -6,6 +6,9 @@
 xcuserdata/
 *.xcuserstate
 
+# Distribution
+dist/
+
 ## Obj-C/Swift specific
 *.hmap
 
