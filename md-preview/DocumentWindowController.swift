@@ -1374,25 +1374,50 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
         return panel
     }
 
+    /// Serial queue for blocking reads. Concurrent reads against a stalled
+    /// FUSE/cloud volume can pin every worker on hung `String(contentsOf:)`
+    /// calls — after that every `loadFile` fires but none complete.
+    private let fileReadQueue = DispatchQueue(label: "doc.md-preview.fileread",
+                                              qos: .userInitiated)
+    /// Latest in-flight load. Cancelled when a newer file is requested so
+    /// rapid clicks don't pile up superseded reads.
+    private var loadTask: Task<Void, Never>?
+
+    private static let fileReadTimeoutSeconds: TimeInterval = 8
+
+    private struct ReadTimeout: Error {}
+
     private func loadFile(at url: URL, silentOnFailure: Bool = false, attempt: Int = 0) {
-        Task { @concurrent [weak self] in
+        PreviewDebugLog.write("loadFile START file=\(url.lastPathComponent) silent=\(silentOnFailure) attempt=\(attempt)")
+        loadTask?.cancel()
+        let queue = fileReadQueue
+        loadTask = Task { [weak self] in
             do {
-                let text = try Self.readMarkdown(at: url)
-                await self?.applyLoadedMarkdown(text, fileURL: url)
-            } catch is TransientEmptyRead {
-                await MainActor.run {
-                    self?.handleTransientEmptyRead(at: url,
-                                                   silentOnFailure: silentOnFailure,
-                                                   attempt: attempt)
+                let text = try await Self.readMarkdown(at: url, on: queue)
+                if Task.isCancelled {
+                    PreviewDebugLog.write("loadFile CANCELLED file=\(url.lastPathComponent)")
+                    return
                 }
+                PreviewDebugLog.write("loadFile OK file=\(url.lastPathComponent) chars=\(text.count)")
+                self?.applyLoadedMarkdown(text, fileURL: url)
+            } catch is TransientEmptyRead {
+                PreviewDebugLog.write("loadFile TRANSIENT-EMPTY file=\(url.lastPathComponent)")
+                self?.handleTransientEmptyRead(at: url,
+                                               silentOnFailure: silentOnFailure,
+                                               attempt: attempt)
+            } catch is ReadTimeout {
+                PreviewDebugLog.write("loadFile TIMEOUT file=\(url.lastPathComponent)")
+                self?.handleTransientEmptyRead(at: url,
+                                               silentOnFailure: silentOnFailure,
+                                               attempt: attempt)
             } catch {
                 // Wrap as NSError (Sendable) so the original presentation —
                 // localizedDescription + recovery suggestion — survives the
                 // hop back to MainActor.
                 let nsError = error as NSError
-                await self?.applyLoadFailure(error: nsError,
-                                             fileURL: url,
-                                             silentOnFailure: silentOnFailure)
+                self?.applyLoadFailure(error: nsError,
+                                       fileURL: url,
+                                       silentOnFailure: silentOnFailure)
             }
         }
     }
@@ -1400,6 +1425,36 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
     /// Cloud / network volumes (iCloud, FUSE mounts, etc.) can report a
     /// non-zero size while transiently returning an empty `String` read.
     private struct TransientEmptyRead: Error {}
+
+    /// Bridges the blocking read onto `queue` (off the cooperative pool) with
+    /// a timeout. A hung FUSE read is abandoned after `fileReadTimeoutSeconds`
+    /// so the serial queue slot frees up for the next file the user picks.
+    private nonisolated static func readMarkdown(at url: URL,
+                                                 on queue: DispatchQueue) async throws -> String {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async {
+                let group = DispatchGroup()
+                var readResult: Result<String, Error>?
+                group.enter()
+                DispatchQueue.global(qos: .userInitiated).async {
+                    defer { group.leave() }
+                    readResult = Result { try readMarkdown(at: url) }
+                }
+                if group.wait(timeout: .now() + fileReadTimeoutSeconds) == .timedOut {
+                    continuation.resume(throwing: ReadTimeout())
+                    return
+                }
+                switch readResult {
+                case .success(let text):
+                    continuation.resume(returning: text)
+                case .failure(let error):
+                    continuation.resume(throwing: error)
+                case .none:
+                    continuation.resume(throwing: ReadTimeout())
+                }
+            }
+        }
+    }
 
     private nonisolated static func readMarkdown(at url: URL) throws -> String {
         let text = try String(contentsOf: url, encoding: .utf8)

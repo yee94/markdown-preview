@@ -84,6 +84,7 @@
 				MarkdownFrontmatter.swift,
 				MarkdownHTML.swift,
 				MarkdownWebView.swift,
+				PreviewDebugLog.swift,
 			);
 			target = 9A02092C2FA10D4C00092060 /* quick-look */;
 		};

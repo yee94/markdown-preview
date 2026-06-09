@@ -56,6 +56,16 @@ final class MarkdownWebView: NSView, WKNavigationDelegate {
     // Bumped on every fast-path JS swap (clear or update) so a stale
     // evaluateJavaScript completion can't blank content after a newer load.
     private var jsUpdateGeneration: UInt64 = 0
+    // A full-page loadHTMLString is in flight, waiting on didFinish. Used to
+    // avoid firing competing loads that cancel each other's navigation —
+    // which, on chatty network/cloud volumes, can starve didFinish forever
+    // and leave isPageReady stuck false (preview frozen).
+    private var isLoadingFullPage = false
+    // Renderer set of the in-flight full-page load; lets us tell whether a
+    // newly-arrived doc can ride the pending load instead of restarting it.
+    private var loadingFingerprint: RendererFingerprint?
+    // Latest article HTML to swap in once the in-flight load reports ready.
+    private var pendingArticleHTML: String?
     // Last unzoomed document height reported by the page (CSS pixels). Cached
     // so a pageZoom change can re-fire heightDidChange with the right scale
     // without waiting for JS to post a fresh value (it won't — scrollHeight
@@ -135,11 +145,17 @@ final class MarkdownWebView: NSView, WKNavigationDelegate {
         // Another display() may have arrived during the off-main render and
         // already swapped the page in — don't stomp it with the warmup doc.
         guard !isPageReady, loadedFingerprint == nil else { return }
-        loadedFingerprint = RendererFingerprint(
+        let fingerprint = RendererFingerprint(
             math: rendered.containsMath,
             mermaid: rendered.containsMermaid,
             code: rendered.containsCode
         )
+        loadedFingerprint = fingerprint
+        // Track the warmup load the same way as a real one, so a display()
+        // that arrives before warmup's didFinish queues onto it instead of
+        // kicking off a competing loadHTMLString.
+        loadingFingerprint = fingerprint
+        isLoadingFullPage = true
         webView.loadHTMLString(rendered.html, baseURL: nil)
     }
 
@@ -224,14 +240,34 @@ final class MarkdownWebView: NSView, WKNavigationDelegate {
         // bundles). The launch-time warmup loads both vendors, so any
         // subsequent file with any subset of renderers fast-paths into it.
         if isPageReady, let loaded = loadedFingerprint, loaded.covers(fingerprint) {
-            let payload = javaScriptStringLiteral(rendered.articleHTML)
-            scheduleArticleUpdate("window.MdPreview && MdPreview.update(\(payload));")
+            applyArticle(rendered.articleHTML)
             return
         }
 
+        // A full-page load is already in flight and will provide every
+        // renderer this doc needs. Don't fire a competing loadHTMLString —
+        // that cancels the in-flight navigation and, under a burst of
+        // reloads (chatty cloud/network volumes), can starve didFinish so
+        // isPageReady never returns true. Queue the latest article instead;
+        // didFinish will swap it in.
+        if isLoadingFullPage, let loading = loadingFingerprint, loading.covers(fingerprint) {
+            pendingArticleHTML = rendered.articleHTML
+            return
+        }
+
+        // Slow path: (re)load the full page.
+        pendingArticleHTML = nil
+        loadingFingerprint = fingerprint
+        isLoadingFullPage = true
+        isPageReady = false
         webView.loadHTMLString(rendered.html, baseURL: nil)
         loadedFingerprint = fingerprint
-        isPageReady = false
+    }
+
+    /// Swaps the article body in-place via JS (fast-path render).
+    private func applyArticle(_ articleHTML: String) {
+        let payload = javaScriptStringLiteral(articleHTML)
+        scheduleArticleUpdate("window.MdPreview && MdPreview.update(\(payload));")
     }
 
     func reloadPreview() {
@@ -764,6 +800,20 @@ final class MarkdownWebView: NSView, WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         neutralizeWebKitScrollEdgeInsets()
         isPageReady = true
+        isLoadingFullPage = false
+        // Apply the freshest article that arrived while the page was loading.
+        if let pending = pendingArticleHTML {
+            pendingArticleHTML = nil
+            applyArticle(pending)
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        isLoadingFullPage = false
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        isLoadingFullPage = false
     }
 
     private func sameDocumentFragmentID(from url: URL) -> String? {
