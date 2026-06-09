@@ -11,14 +11,16 @@ final class MainSplitViewController: NSSplitViewController {
 
     var onSelectFile: ((URL) -> Void)?
 
+    private let previewViewController = ContentViewController()
+
     override func viewDidLoad() {
         super.viewDidLoad()
 
         let sidebarVC = SidebarViewController()
         sidebarVC.onSelectHeading = { [weak self] index in
             // Pin before scrolling so a no-op scroll still confirms the click.
-            self?.contentViewController?.markHeadingActiveFromClick(index)
-            self?.contentViewController?.scrollToHeading(index: index)
+            self?.previewViewController.markHeadingActiveFromClick(index)
+            self?.previewViewController.scrollToHeading(index: index)
         }
         sidebarVC.onSelectFile = { [weak self] url in
             self?.onSelectFile?(url)
@@ -29,7 +31,7 @@ final class MainSplitViewController: NSSplitViewController {
         sidebar.canCollapse = true
         sidebar.canCollapseFromWindowResize = false
 
-        let content = NSSplitViewItem(viewController: ContentViewController())
+        let content = NSSplitViewItem(viewController: previewViewController)
         content.minimumThickness = 420
 
         let inspector = NSSplitViewItem(inspectorWithViewController: InspectorViewController())
@@ -45,13 +47,13 @@ final class MainSplitViewController: NSSplitViewController {
         splitView.autosaveName = "MainSplitView"
 
         // Wired after addSplitViewItem so the accessors are non-nil.
-        contentViewController?.activeHeadingDidChange = { [weak self] headingID in
+        previewViewController.activeHeadingDidChange = { [weak self] headingID in
             self?.sidebarViewController?.setActiveHeading(headingID)
         }
     }
 
     func display(markdown: String, fileName: String, url: URL?, assetBaseURL: URL?) {
-        contentViewController?.display(markdown: markdown, assetBaseURL: assetBaseURL)
+        previewViewController.display(markdown: markdown, assetBaseURL: assetBaseURL)
         sidebarViewController?.display(markdown: markdown, fileName: fileName, fileURL: url)
         inspectorViewController?.display(metadata: DocumentMetadata.make(url: url, markdown: markdown))
     }
@@ -71,38 +73,38 @@ final class MainSplitViewController: NSSplitViewController {
     }
 
     func clearContent() {
-        contentViewController?.clearContent()
+        previewViewController.clearContent()
     }
 
     func find(_ query: String,
               backwards: Bool = false,
               mode: SearchMode = .contains,
               completion: ((FindResult) -> Void)? = nil) {
-        contentViewController?.find(query, backwards: backwards, mode: mode, completion: completion)
+        previewViewController.find(query, backwards: backwards, mode: mode, completion: completion)
     }
 
     // Custom selector (instead of `print:`) so AppKit's inherited
     // NSView/NSWindow `print:` doesn't intercept higher in the responder chain
     // and print the sidebar / whole window contents.
     @IBAction func printMarkdown(_ sender: Any?) {
-        contentViewController?.printDocument()
+        previewViewController.printDocument()
     }
 
     @IBAction func zoomInDocument(_ sender: Any?) {
-        contentViewController?.zoomIn()
+        previewViewController.zoomIn()
     }
 
     @IBAction func zoomOutDocument(_ sender: Any?) {
-        contentViewController?.zoomOut()
+        previewViewController.zoomOut()
     }
 
     @IBAction func resetDocumentZoom(_ sender: Any?) {
-        contentViewController?.resetZoom()
+        previewViewController.resetZoom()
     }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if menuItem.action == #selector(resetDocumentZoom(_:)) {
-            return abs((contentViewController?.pageZoom ?? 1.0) - 1.0) > 0.001
+            return abs(previewViewController.pageZoom - 1.0) > 0.001
         }
         return true
     }
@@ -146,10 +148,6 @@ final class MainSplitViewController: NSSplitViewController {
 
     private var sidebarViewController: SidebarViewController? {
         splitViewItems.first?.viewController as? SidebarViewController
-    }
-
-    private var contentViewController: ContentViewController? {
-        splitViewItems.dropFirst().first?.viewController as? ContentViewController
     }
 
     private var inspectorViewController: InspectorViewController? {

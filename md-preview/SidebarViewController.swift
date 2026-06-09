@@ -368,6 +368,9 @@ private final class FileNode {
     let url: URL
     let isDirectory: Bool
     private var loadedChildren: [FileNode]?
+    /// Snapshot taken at invalidateCache(); used as a fallback when
+    /// the next disk read returns empty (iCloud .revoke remount blip).
+    private var previousChildren: [FileNode]?
 
     init(url: URL, isDirectory: Bool) {
         self.url = url
@@ -379,7 +382,20 @@ private final class FileNode {
     /// Children if `children()` has populated the cache; nil otherwise.
     var cachedChildren: [FileNode]? { loadedChildren }
 
-    func invalidateCache() { loadedChildren = nil }
+    /// Returns true if this directory previously had children but now
+    /// reports empty after a cache invalidation (stale after iCloud blip).
+    var hasStaleEmptyChildren: Bool {
+        guard isDirectory else { return false }
+        if let prev = previousChildren, !prev.isEmpty { return true }
+        return false
+    }
+
+    func invalidateCache() {
+        if let old = loadedChildren, !old.isEmpty {
+            previousChildren = old
+        }
+        loadedChildren = nil
+    }
 
     func children() -> [FileNode] {
         if let cached = loadedChildren { return cached }
@@ -401,8 +417,34 @@ private final class FileNode {
             if lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory }
             return lhs.displayName.localizedStandardCompare(rhs.displayName) == .orderedAscending
         }
+        // iCloud / .revoke can cause transient empty reads. Fall back to
+        // the pre-invalidate snapshot so the tree doesn't collapse, and
+        // leave loadedChildren = nil so the next access retries from disk.
+        if sorted.isEmpty, let fallback = previousChildren, !fallback.isEmpty {
+            return fallback
+        }
+        previousChildren = nil
         loadedChildren = sorted
         return sorted
+    }
+}
+
+private final class ProjectNavigatorOutlineView: NSOutlineView {
+
+    weak var navigator: ProjectNavigatorView?
+
+    override func keyDown(with event: NSEvent) {
+        switch event.keyCode {
+        case 126:
+            navigator?.selectSiblingFile(forward: false)
+            return
+        case 125:
+            navigator?.selectSiblingFile(forward: true)
+            return
+        default:
+            break
+        }
+        super.keyDown(with: event)
     }
 }
 
@@ -411,8 +453,10 @@ final class ProjectNavigatorView: NSView {
     var onSelectFile: ((URL) -> Void)?
 
     private let scrollView = NSScrollView()
-    private let outlineView = NSOutlineView()
+    private let outlineView = ProjectNavigatorOutlineView()
     private var rootNode: FileNode?
+    /// The file currently shown in the preview; drives sibling navigation.
+    private var previewFileURL: URL?
     // One watcher per loaded directory; kept in sync with which FileNodes
     // currently have a populated children cache.
     private var watchers: [URL: DirectoryWatcher] = [:]
@@ -443,8 +487,9 @@ final class ProjectNavigatorView: NSView {
         outlineView.delegate = self
         outlineView.target = self
         outlineView.action = #selector(rowClicked)
+        outlineView.doubleAction = #selector(rowDoubleClicked)
         outlineView.indentationPerLevel = 14
-        outlineView.refusesFirstResponder = true
+        outlineView.navigator = self
 
         let contextMenu = NSMenu()
         contextMenu.delegate = self
@@ -523,6 +568,33 @@ final class ProjectNavigatorView: NSView {
             reExpand(rootNode, expanded: expandedURLs)
         }
         syncWatchers()
+        // iCloud / .revoke can cause transient empty reads. Schedule a
+        // deferred retry so a blip doesn't permanently collapse the tree.
+        scheduleStaleCheck()
+    }
+
+    // MARK: - Stale cache recovery
+
+    private var staleCheckWork: DispatchWorkItem?
+
+    private func scheduleStaleCheck() {
+        staleCheckWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, let rootNode = self.rootNode else { return }
+            if self.hasStaleEmptyDirectory(rootNode) {
+                self.refreshTree()
+            }
+        }
+        staleCheckWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
+    }
+
+    /// Returns true if any directory node has a pre-invalidate snapshot
+    /// but the current disk read returned empty (iCloud remount blip).
+    private func hasStaleEmptyDirectory(_ node: FileNode) -> Bool {
+        guard node.isDirectory else { return false }
+        if node.hasStaleEmptyChildren { return true }
+        return node.cachedChildren?.contains(where: hasStaleEmptyDirectory) ?? false
     }
 
     private func invalidateCaches(_ node: FileNode) {
@@ -567,6 +639,7 @@ final class ProjectNavigatorView: NSView {
     }
 
     func setCurrentFile(_ url: URL?) {
+        previewFileURL = url?.standardizedFileURL
         guard let url, let rootNode else {
             outlineView.deselectAll(nil)
             return
@@ -616,11 +689,70 @@ final class ProjectNavigatorView: NSView {
         return false
     }
 
+    /// Moves the preview to the previous or next markdown file in the
+    /// same directory. No-op when already at the boundary.
+    fileprivate func selectSiblingFile(forward: Bool) {
+        guard let rootNode,
+              let currentURL = previewFileURL ?? currentlySelectedFileURL() else { return }
+        guard let siblings = siblingMarkdownFiles(for: currentURL, from: rootNode),
+              let index = siblings.firstIndex(where: { $0.url.standardizedFileURL == currentURL }) else { return }
+        let nextIndex = forward ? index + 1 : index - 1
+        guard siblings.indices.contains(nextIndex) else { return }
+        let nextURL = siblings[nextIndex].url
+        previewFileURL = nextURL.standardizedFileURL
+        setCurrentFile(nextURL)
+        onSelectFile?(nextURL)
+    }
+
+    private func currentlySelectedFileURL() -> URL? {
+        let row = outlineView.selectedRow
+        guard row >= 0,
+              let node = outlineView.item(atRow: row) as? FileNode,
+              !node.isDirectory else { return nil }
+        return node.url.standardizedFileURL
+    }
+
+    private func siblingMarkdownFiles(for fileURL: URL, from root: FileNode) -> [FileNode]? {
+        let parentURL = fileURL.deletingLastPathComponent().standardizedFileURL
+        guard let parent = findDirectoryNode(for: parentURL, from: root) else { return nil }
+        let files = parent.children().filter { !$0.isDirectory }
+        return files.isEmpty ? nil : files
+    }
+
+    private func findDirectoryNode(for directoryURL: URL, from root: FileNode) -> FileNode? {
+        let target = directoryURL.standardizedFileURL
+        if root.url.standardizedFileURL == target { return root }
+        return findDirectoryNode(for: target, under: root)
+    }
+
+    private func findDirectoryNode(for target: URL, under node: FileNode) -> FileNode? {
+        for child in node.children() where child.isDirectory {
+            if child.url.standardizedFileURL == target { return child }
+            if target.isDescendantOrSame(of: child.url),
+               let found = findDirectoryNode(for: target, under: child) {
+                return found
+            }
+        }
+        return nil
+    }
+
     @objc private func rowClicked() {
         let row = outlineView.clickedRow
         guard row >= 0, let node = outlineView.item(atRow: row) as? FileNode else { return }
         if !node.isDirectory {
+            previewFileURL = node.url.standardizedFileURL
             onSelectFile?(node.url)
+        }
+    }
+
+    @objc private func rowDoubleClicked() {
+        let row = outlineView.clickedRow
+        guard row >= 0, let node = outlineView.item(atRow: row) as? FileNode else { return }
+        guard node.isDirectory, !node.children().isEmpty else { return }
+        if outlineView.isItemExpanded(node) {
+            outlineView.collapseItem(node)
+        } else {
+            outlineView.expandItem(node)
         }
     }
 

@@ -40,7 +40,9 @@ final class MarkdownDocument: NSDocument {
             controller.openFolder(folderURL)
             return
         }
-        controller.display(markdown: markdown, fileURL: fileURL)
+        if let fileURL {
+            controller.display(markdown: markdown, fileURL: fileURL)
+        }
     }
 
     override nonisolated func read(from url: URL, ofType typeName: String) throws {

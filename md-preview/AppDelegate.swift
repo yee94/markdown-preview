@@ -53,6 +53,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isOpeningDocumentFromPrompt = false
     private var isPromptingForDocument = false
     private var isDocumentPromptScheduled = false
+    private var welcomeWindowController: WelcomeWindowController?
 
     private static let markdownFileExtensions = ["md", "markdown", "mdown", "txt"]
 
@@ -61,7 +62,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installGoMenu()
         installAppMenuItemIcons()
         installZoomMenuItemIcons()
-        scheduleDocumentPrompt(requiresNoDocuments: true)
+        presentInitialWindowIfNeeded()
+        DispatchQueue.main.async { [weak self] in
+            self?.presentInitialWindowIfNeeded()
+        }
+        // State restoration can finish after the first turn of the run loop.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            self?.presentInitialWindowIfNeeded()
+        }
     }
 
     func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool {
@@ -69,19 +77,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationOpenUntitledFile(_ sender: NSApplication) -> Bool {
-        scheduleDocumentPrompt(requiresNoDocuments: true)
+        DispatchQueue.main.async { [weak self] in
+            self?.presentInitialWindowIfNeeded()
+        }
         return true
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag {
-            scheduleDocumentPrompt(requiresNoDocuments: true)
+            if let controller = activeDocumentWindowController {
+                controller.bringWindowToFront()
+            } else {
+                showWelcomeWindow()
+            }
+            NSApp.activate(ignoringOtherApps: true)
             return false
         }
         return true
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        dismissWelcomeWindow()
         for url in urls {
             if url.isExistingDirectory {
                 openFolder(url)
@@ -93,6 +110,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let error else { return }
                 NSAlert(error: error).runModal()
             }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.presentInitialWindowIfNeeded()
         }
     }
 
@@ -193,6 +213,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func presentInitialWindowIfNeeded() {
+        closeEmptyDocumentWindows()
+        ensureDocumentWindowsArePresentable()
+        guard !hasAnyOnScreenAppWindow else { return }
+        showWelcomeWindow()
+    }
+
+    /// Any key-capable window currently intersecting a visible screen frame.
+    private var hasAnyOnScreenAppWindow: Bool {
+        NSApp.windows.contains { window in
+            guard window.level == .normal else { return false }
+            guard window.isVisible else { return false }
+            guard window.canBecomeKey else { return false }
+            guard window.frame.width > 100, window.frame.height > 100 else { return false }
+            guard let screen = window.screen ?? NSScreen.main else { return true }
+            return screen.visibleFrame.intersects(window.frame)
+        }
+    }
+
+    private func ensureDocumentWindowsArePresentable() {
+        for document in NSDocumentController.shared.documents {
+            for controller in document.windowControllers {
+                guard let documentController = controller as? DocumentWindowController else { continue }
+                guard documentController.isWindowVisible else { continue }
+                if documentController.isOnScreen {
+                    documentController.bringWindowToFront()
+                } else {
+                    documentController.centerWindow()
+                }
+            }
+        }
+    }
+
+    private func showWelcomeWindow() {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+
+        if welcomeWindowController == nil {
+            let controller = WelcomeWindowController()
+            controller.onChooseFolder = { [weak self] url in
+                self?.openFolder(url)
+            }
+            welcomeWindowController = controller
+        }
+        welcomeWindowController?.present()
+    }
+
+    private func dismissWelcomeWindow() {
+        welcomeWindowController?.close()
+    }
+
+    func dismissWelcomeWindowIfNeeded() {
+        dismissWelcomeWindow()
+    }
+
+    private func closeEmptyDocumentWindows() {
+        for document in NSDocumentController.shared.documents {
+            guard let windowController = document.windowControllers.first as? DocumentWindowController,
+                  windowController.isEmpty else { continue }
+            document.close()
+        }
+    }
+
+    func documentWindowDidClose() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard !self.hasAnyOnScreenAppWindow else { return }
+            self.showWelcomeWindow()
+        }
+    }
+
     private func scheduleDocumentPrompt(requiresNoDocuments: Bool = false) {
         guard !isPromptingForDocument,
               !isDocumentPromptScheduled else { return }
@@ -208,6 +299,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func openFolder(_ url: URL) {
+        dismissWelcomeWindow()
+        RecentFoldersStore.record(url)
         if let controller = activeDocumentWindowController {
             controller.openFolder(url)
             return
@@ -363,7 +456,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         can_replace_primary "$primary" || refuse_existing_command "$primary"
-        for alias in mdp markdown-preview; do
+        for alias in mdp markdown-preview mp; do
           can_replace_alias "$install_dir/$alias" || refuse_existing_command "$install_dir/$alias"
         done
 
@@ -385,7 +478,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
           install -m 755 "$tmp_dir/md-preview" "$primary"
         fi
 
-        for alias in mdp markdown-preview; do
+        for alias in mdp markdown-preview mp; do
           alias_path="$install_dir/$alias"
           if [ "$needs_sudo" = "true" ]; then
             sudo ln -sfn "md-preview" "$alias_path"
@@ -398,25 +491,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         echo "Markdown Preview CLI is ready."
         echo
         echo "Use any of these commands:"
+        echo "  mp"
         echo "  mdp"
         echo "  md-preview"
         echo "  markdown-preview"
         echo
         echo "Examples:"
-        echo "  mdp README.md        Open a Markdown file"
-        echo "  mdp .                Open the current folder"
-        echo "  mdp docs             Browse a folder in Markdown Preview"
+        echo "  mp README.md        Open a Markdown file"
+        echo "  mp .                Open the current folder"
+        echo "  mp docs             Browse a folder in Markdown Preview"
         echo
         echo "Tips:"
-        echo "  Use mdp for the shortest command."
+        echo "  Use mp or mdp for the shortest command."
         echo "  Re-run Install CLI... after updating the app to refresh these commands."
         echo "  Installed in: $install_dir"
         echo
 
-        if command -v mdp >/dev/null 2>&1; then
+        if command -v mp >/dev/null 2>&1; then
+          echo "Try it now: mp ."
+        elif command -v mdp >/dev/null 2>&1; then
           echo "Try it now: mdp ."
         else
-          echo "Open a new terminal window, then try: mdp ."
+          echo "Open a new terminal window, then try: mp ."
         fi
         """
 

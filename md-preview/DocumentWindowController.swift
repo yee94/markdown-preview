@@ -33,6 +33,7 @@ private extension Array where Element == NSToolbarItem.Identifier {
 final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSToolbarDelegate, NSSharingServicePickerToolbarItemDelegate, NSSearchFieldDelegate, NSMenuDelegate {
 
     private var currentFileURL: URL?
+    private var currentFolderURL: URL?
     private var currentMarkdown: String?
     private var fileWatcher: FileWatcher?
     private var isInspectorToggleSelected = false
@@ -105,11 +106,42 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
     func windowWillClose(_ notification: Notification) {
         fileWatcher?.cancel()
         fileWatcher = nil
+        DispatchQueue.main.async {
+            (NSApp.delegate as? AppDelegate)?.documentWindowDidClose()
+        }
+    }
+
+    var isEmpty: Bool {
+        currentFileURL == nil && currentFolderURL == nil
+    }
+
+    var isWindowVisible: Bool {
+        guard let window else { return false }
+        return window.isVisible
+    }
+
+    var isOnScreen: Bool {
+        guard documentWindow.isVisible else { return false }
+        guard let screen = documentWindow.screen ?? NSScreen.main else { return true }
+        return screen.visibleFrame.intersects(documentWindow.frame)
+    }
+
+    func centerWindow() {
+        documentWindow.center()
+        bringWindowToFront()
+    }
+
+    func bringWindowToFront() {
+        documentWindow.makeKeyAndOrderFront(nil)
+        NSApp.activate()
     }
 
     func display(markdown: String, fileURL: URL?) {
         currentFileURL = fileURL
         currentMarkdown = markdown
+        if fileURL != nil {
+            (NSApp.delegate as? AppDelegate)?.dismissWelcomeWindowIfNeeded()
+        }
         documentWindow.title = fileURL?.lastPathComponent ?? "Untitled"
         documentWindow.makeKeyAndOrderFront(nil)
         NSApp.activate()
@@ -1256,6 +1288,9 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
 
     func openFolder(_ folderURL: URL) {
         let folderURL = folderURL.standardizedFileURL
+        currentFolderURL = folderURL
+        RecentFoldersStore.record(folderURL)
+        (NSApp.delegate as? AppDelegate)?.dismissWelcomeWindowIfNeeded()
         if currentFileURL == nil {
             documentWindow.title = folderURL.lastPathComponent
         }

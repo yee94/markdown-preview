@@ -9,6 +9,7 @@ final class ContentViewController: NSViewController {
 
     private static let pageZoomDefaultsKey = "MarkdownPreview.pageZoom"
 
+    private var scrollView: NSScrollView!
     private var webView: MarkdownWebView!
     private var documentHeightConstraint: NSLayoutConstraint!
     private var webViewHeightConstraint: NSLayoutConstraint!
@@ -44,7 +45,7 @@ final class ContentViewController: NSViewController {
     var activeHeadingDidChange: ((Int?) -> Void)?
 
     override func loadView() {
-        let scrollView = NSScrollView()
+        scrollView = NSScrollView()
         scrollView.drawsBackground = false
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
