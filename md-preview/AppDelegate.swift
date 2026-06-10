@@ -58,6 +58,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let markdownFileExtensions = ["md", "markdown", "mdown", "txt"]
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        PreviewDebugLog.resetSession()
         installSidebarViewMenuItems()
         installGoMenu()
         installAppMenuItemIcons()

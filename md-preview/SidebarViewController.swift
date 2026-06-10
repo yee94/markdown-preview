@@ -13,7 +13,7 @@ final class SidebarViewController: NSViewController {
     }
 
     var onSelectHeading: ((Int) -> Void)?
-    var onSelectFile: ((URL) -> Void)?
+    var onSelectFile: ((URL, String) -> Void)?
     var onModeChanged: ((Mode) -> Void)?
 
     private var contentContainer: NSView!
@@ -76,8 +76,8 @@ final class SidebarViewController: NSViewController {
 
         projectNavigator = ProjectNavigatorView()
         projectNavigator.translatesAutoresizingMaskIntoConstraints = false
-        projectNavigator.onSelectFile = { [weak self] url in
-            self?.onSelectFile?(url)
+        projectNavigator.onSelectFile = { [weak self] url, source in
+            self?.onSelectFile?(url, source)
         }
         contentContainer.addSubview(projectNavigator)
 
@@ -171,6 +171,11 @@ final class SidebarViewController: NSViewController {
         if currentMode == .files {
             refreshNavigatorIfNeeded()
         }
+    }
+
+    func refreshProjectNavigator() {
+        loadViewIfNeeded()
+        projectNavigator.refresh()
     }
 
     /// Defers folder enumeration until the user is actually in the
@@ -363,24 +368,33 @@ extension SidebarViewController: NSOutlineViewDelegate {
 // MARK: - Project Navigator
 
 private final class FileNode {
-    static let markdownExtensions: Set<String> = ["md", "markdown", "mdown", "mkd", "mdwn"]
+    nonisolated static let markdownExtensions: Set<String> = ["md", "markdown", "mdown", "mkd", "mdwn"]
 
     let url: URL
     let isDirectory: Bool
+    let isPlaceholder: Bool
     private var loadedChildren: [FileNode]?
+    private var loadingChildren = false
     /// Snapshot taken at invalidateCache(); used as a fallback when
     /// the next disk read returns empty (iCloud .revoke remount blip).
     private var previousChildren: [FileNode]?
 
-    init(url: URL, isDirectory: Bool) {
+    init(url: URL, isDirectory: Bool, isPlaceholder: Bool = false) {
         self.url = url
         self.isDirectory = isDirectory
+        self.isPlaceholder = isPlaceholder
     }
 
-    var displayName: String { url.lastPathComponent }
+    var displayName: String { isPlaceholder ? "Loading..." : url.lastPathComponent }
 
     /// Children if `children()` has populated the cache; nil otherwise.
     var cachedChildren: [FileNode]? { loadedChildren }
+    var isLoadingChildren: Bool { loadingChildren }
+    var cachedOrPreviousChildren: [FileNode]? {
+        if let loadedChildren, !loadedChildren.isEmpty { return loadedChildren }
+        if let previousChildren, !previousChildren.isEmpty { return previousChildren }
+        return nil
+    }
 
     /// Returns true if this directory previously had children but now
     /// reports empty after a cache invalidation (stale after iCloud blip).
@@ -403,30 +417,68 @@ private final class FileNode {
             loadedChildren = []
             return []
         }
+        // Never hit the file system from NSOutlineView dataSource callbacks.
+        // On network/FUSE volumes, synchronous directory reads here block the
+        // main thread during layout and make the whole app feel frozen.
+        if let previousChildren, !previousChildren.isEmpty {
+            return previousChildren
+        }
+        return []
+    }
+
+    func replaceChildren(_ children: [FileNode]) {
+        previousChildren = nil
+        loadedChildren = children
+        loadingChildren = false
+    }
+
+    func children(from entries: [FileEntry]) -> [FileNode] {
+        let existingChildren = cachedOrPreviousChildren ?? []
+        var existingByURL: [URL: FileNode] = [:]
+        for child in existingChildren {
+            existingByURL[child.url.standardizedFileURL] = child
+        }
+        return entries.map { entry in
+            let key = entry.url.standardizedFileURL
+            if let existing = existingByURL[key], existing.isDirectory == entry.isDirectory {
+                return existing
+            }
+            return FileNode(url: entry.url, isDirectory: entry.isDirectory)
+        }
+    }
+
+    func beginLoadingChildren() {
+        loadingChildren = true
+    }
+
+    func endLoadingChildren() {
+        loadingChildren = false
+    }
+
+    nonisolated static func loadEntries(at url: URL) -> [FileEntry] {
         let entries = (try? FileManager.default.contentsOfDirectory(
             at: url,
             includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles])) ?? []
-        let nodes: [FileNode] = entries.compactMap { entry in
+        let nodes: [FileEntry] = entries.compactMap { entry in
             let isDir = (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
-            if isDir { return FileNode(url: entry, isDirectory: true) }
-            guard FileNode.markdownExtensions.contains(entry.pathExtension.lowercased()) else { return nil }
-            return FileNode(url: entry, isDirectory: false)
+            if isDir { return FileEntry(url: entry, isDirectory: true) }
+            guard markdownExtensions.contains(entry.pathExtension.lowercased()) else { return nil }
+            return FileEntry(url: entry, isDirectory: false)
         }
         let sorted = nodes.sorted { lhs, rhs in
             if lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory }
             return lhs.displayName.localizedStandardCompare(rhs.displayName) == .orderedAscending
         }
-        // iCloud / .revoke can cause transient empty reads. Fall back to
-        // the pre-invalidate snapshot so the tree doesn't collapse, and
-        // leave loadedChildren = nil so the next access retries from disk.
-        if sorted.isEmpty, let fallback = previousChildren, !fallback.isEmpty {
-            return fallback
-        }
-        previousChildren = nil
-        loadedChildren = sorted
         return sorted
     }
+}
+
+private struct FileEntry: Sendable {
+    let url: URL
+    let isDirectory: Bool
+
+    nonisolated var displayName: String { url.lastPathComponent }
 }
 
 private final class ProjectNavigatorOutlineView: NSOutlineView {
@@ -450,16 +502,24 @@ private final class ProjectNavigatorOutlineView: NSOutlineView {
 
 final class ProjectNavigatorView: NSView {
 
-    var onSelectFile: ((URL) -> Void)?
+    var onSelectFile: ((URL, String) -> Void)?
 
     private let scrollView = NSScrollView()
     private let outlineView = ProjectNavigatorOutlineView()
     private var rootNode: FileNode?
     /// The file currently shown in the preview; drives sibling navigation.
     private var previewFileURL: URL?
+    private var folderChangeWork: DispatchWorkItem?
+    private let directoryLoadQueue = DispatchQueue(label: "doc.md-preview.project-navigator.load",
+                                                   qos: .utility)
+    private var loadingDirectories: Set<URL> = []
+    private var navigatorLoadGeneration = 0
+    private var emptyDirectoryRetryCounts: [URL: Int] = [:]
     // One watcher per loaded directory; kept in sync with which FileNodes
     // currently have a populated children cache.
     private var watchers: [URL: DirectoryWatcher] = [:]
+    private static let folderIcon = makeTemplateIcon("folder")
+    private static let documentIcon = makeTemplateIcon("doc.text")
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -511,30 +571,29 @@ final class ProjectNavigatorView: NSView {
         ])
     }
 
+    func refresh() {
+        refreshTree()
+    }
+
     func setRoot(_ url: URL?) {
         cancelAllWatchers()
+        loadingDirectories.removeAll()
+        emptyDirectoryRetryCounts.removeAll()
+        navigatorLoadGeneration += 1
         rootNode = url.map { FileNode(url: $0.standardizedFileURL, isDirectory: true) }
         outlineView.reloadData()
         if let rootNode {
             outlineView.expandItem(rootNode)
-            syncWatchers()
+            requestChildrenLoad(for: rootNode, reloadParent: nil)
         }
     }
 
     // MARK: - Folder watching
 
     private func syncWatchers() {
-        var live: Set<URL> = []
-        if let rootNode { collectLoadedDirectories(rootNode, into: &live) }
-        for url in live where watchers[url] == nil {
-            watchers[url] = DirectoryWatcher(url: url) { [weak self] in
-                self?.handleFolderChange()
-            }
-        }
-        for (url, watcher) in watchers where !live.contains(url) {
-            watcher.cancel()
-            watchers.removeValue(forKey: url)
-        }
+        // Project Navigator is intentionally snapshot-based for network/FUSE
+        // volumes. Automatic file-system reloads can invalidate the visible
+        // tree while the volume is remounting; users refresh explicitly.
     }
 
     private func collectLoadedDirectories(_ node: FileNode, into set: inout Set<URL>) {
@@ -547,30 +606,147 @@ final class ProjectNavigatorView: NSView {
     }
 
     private func cancelAllWatchers() {
+        folderChangeWork?.cancel()
+        folderChangeWork = nil
+        staleCheckWork?.cancel()
+        staleCheckWork = nil
         for watcher in watchers.values { watcher.cancel() }
         watchers.removeAll()
     }
 
+    private func requestChildrenLoad(for node: FileNode, reloadParent parent: FileNode?) {
+        guard node.isDirectory else { return }
+        let url = node.url.standardizedFileURL
+        guard !loadingDirectories.contains(url) else { return }
+        loadingDirectories.insert(url)
+        node.beginLoadingChildren()
+        let generation = navigatorLoadGeneration
+        PreviewDebugLog.event("navigator.load.request", [
+            "generation": generation,
+            "url": url.path,
+            "hasSnapshot": node.cachedOrPreviousChildren != nil
+        ])
+        directoryLoadQueue.async { [weak self, weak node, weak parent] in
+            PreviewDebugLog.event("navigator.load.start", [
+                "generation": generation,
+                "url": url.path
+            ])
+            let entries = FileNode.loadEntries(at: url)
+            PreviewDebugLog.event("navigator.load.finish", [
+                "generation": generation,
+                "url": url.path,
+                "entries": entries.count,
+                "directories": entries.filter(\.isDirectory).count,
+                "files": entries.filter { !$0.isDirectory }.count
+            ])
+            DispatchQueue.main.async {
+                guard let self, let node else { return }
+                guard self.navigatorLoadGeneration == generation else {
+                    PreviewDebugLog.event("navigator.load.drop", [
+                        "reason": "stale_generation",
+                        "generation": generation,
+                        "currentGeneration": self.navigatorLoadGeneration,
+                        "url": url.path
+                    ])
+                    return
+                }
+                self.loadingDirectories.remove(url)
+                let children = node.children(from: entries)
+                let reusedChildren = children.filter { child in
+                    node.cachedOrPreviousChildren?.contains { $0 === child } == true
+                }.count
+                // Network volumes can transiently report empty while the old
+                // snapshot is still the better UX. Keep the old cache in that
+                // case; the refresh button gives users an explicit retry.
+                if children.isEmpty,
+                   let snapshot = node.cachedOrPreviousChildren,
+                   !snapshot.isEmpty {
+                    node.endLoadingChildren()
+                    PreviewDebugLog.event("navigator.load.keep_snapshot", [
+                        "generation": generation,
+                        "url": url.path,
+                        "snapshotChildren": snapshot.count
+                    ])
+                    return
+                }
+                if !children.isEmpty {
+                    self.emptyDirectoryRetryCounts[url] = nil
+                }
+                let wasExpanded = self.outlineView.isItemExpanded(node)
+                node.replaceChildren(children)
+                PreviewDebugLog.event("navigator.load.apply", [
+                    "generation": generation,
+                    "url": url.path,
+                    "children": children.count,
+                    "reusedChildren": reusedChildren,
+                    "wasExpanded": wasExpanded
+                ])
+                if let parent {
+                    self.outlineView.reloadItem(parent, reloadChildren: true)
+                } else {
+                    self.outlineView.reloadItem(node, reloadChildren: true)
+                    if node === self.rootNode || wasExpanded {
+                        self.outlineView.expandItem(node)
+                    }
+                }
+                self.syncWatchers()
+                if let previewFileURL = self.previewFileURL {
+                    self.setCurrentFile(previewFileURL)
+                }
+            }
+        }
+    }
+
+    @discardableResult
+    private func scheduleEmptyDirectoryRetry(for node: FileNode) -> Bool {
+        let url = node.url.standardizedFileURL
+        let attempts = emptyDirectoryRetryCounts[url, default: 0]
+        guard attempts < 4 else { return false }
+        emptyDirectoryRetryCounts[url] = attempts + 1
+        let delay = min(8.0, pow(2.0, Double(attempts)))
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak node] in
+            guard let self, let node else { return }
+            self.requestChildrenLoad(for: node, reloadParent: nil)
+        }
+        return true
+    }
+
     private func handleFolderChange() {
-        let selectedURL = currentlySelectedURL()
-        refreshTree()
-        if let selectedURL { setCurrentFile(selectedURL) }
+        folderChangeWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            let selectedURL = self.currentlySelectedURL()
+            self.refreshTree()
+            if let selectedURL { self.setCurrentFile(selectedURL) }
+        }
+        folderChangeWork = work
+        // Directory watchers can fire once per expanded folder on network /
+        // FUSE volumes. Coalesce them into one outline reload so AppKit does
+        // not spend seconds rebuilding row views on the main thread.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
     }
 
     /// Reloads the outline from disk while preserving expansion state.
     /// Selection is left to the caller.
     private func refreshTree() {
         let expandedURLs = collectExpandedURLs()
+        navigatorLoadGeneration += 1
+        loadingDirectories.removeAll()
+        emptyDirectoryRetryCounts.removeAll()
+        PreviewDebugLog.event("navigator.refresh", [
+            "generation": navigatorLoadGeneration,
+            "expanded": expandedURLs.count,
+            "root": rootNode?.url.path ?? "nil"
+        ])
         if let rootNode { invalidateCaches(rootNode) }
         outlineView.reloadData()
         if let rootNode {
             outlineView.expandItem(rootNode)
             reExpand(rootNode, expanded: expandedURLs)
+            requestChildrenLoad(for: rootNode, reloadParent: nil)
+            requestLoads(for: rootNode, expanded: expandedURLs)
         }
         syncWatchers()
-        // iCloud / .revoke can cause transient empty reads. Schedule a
-        // deferred retry so a blip doesn't permanently collapse the tree.
-        scheduleStaleCheck()
     }
 
     // MARK: - Stale cache recovery
@@ -605,6 +781,23 @@ final class ProjectNavigatorView: NSView {
         node.invalidateCache()
     }
 
+    private func requestLoads(for node: FileNode, expanded: Set<URL>) {
+        guard node.isDirectory else { return }
+        if expanded.contains(node.url.standardizedFileURL) {
+            requestChildrenLoad(for: node, reloadParent: nil)
+        }
+        for child in node.children() where child.isDirectory {
+            requestLoads(for: child, expanded: expanded)
+        }
+    }
+
+    private static func makeTemplateIcon(_ systemName: String) -> NSImage? {
+        let image = NSImage(systemSymbolName: systemName, accessibilityDescription: nil)
+        image?.isTemplate = true
+        image?.size = NSSize(width: 16, height: 16)
+        return image
+    }
+
     private func collectExpandedURLs() -> Set<URL> {
         var result: Set<URL> = []
         func walk(_ item: Any?) {
@@ -624,7 +817,8 @@ final class ProjectNavigatorView: NSView {
     private func currentlySelectedURL() -> URL? {
         let row = outlineView.selectedRow
         guard row >= 0,
-              let node = outlineView.item(atRow: row) as? FileNode else { return nil }
+              let node = outlineView.item(atRow: row) as? FileNode,
+              !node.isPlaceholder else { return nil }
         return node.url.standardizedFileURL
     }
 
@@ -647,15 +841,9 @@ final class ProjectNavigatorView: NSView {
         let target = url.standardizedFileURL
         var path: [FileNode] = []
         if !collectPath(to: target, from: rootNode, into: &path) {
-            // Cache might be stale (file was just renamed and our
-            // DirectoryWatcher hasn't fired yet). Refresh from disk once
-            // and retry before giving up.
-            refreshTree()
-            path = []
-            guard collectPath(to: target, from: rootNode, into: &path) else {
-                outlineView.deselectAll(nil)
-                return
-            }
+            requestChildrenLoad(for: rootNode, reloadParent: nil)
+            outlineView.deselectAll(nil)
+            return
         }
         for ancestor in path.dropLast() {
             outlineView.expandItem(ancestor)
@@ -701,21 +889,22 @@ final class ProjectNavigatorView: NSView {
         let nextURL = siblings[nextIndex].url
         previewFileURL = nextURL.standardizedFileURL
         setCurrentFile(nextURL)
-        onSelectFile?(nextURL)
+        onSelectFile?(nextURL, "sidebar.keyboard")
     }
 
     private func currentlySelectedFileURL() -> URL? {
         let row = outlineView.selectedRow
         guard row >= 0,
               let node = outlineView.item(atRow: row) as? FileNode,
-              !node.isDirectory else { return nil }
+              !node.isDirectory,
+              !node.isPlaceholder else { return nil }
         return node.url.standardizedFileURL
     }
 
     private func siblingMarkdownFiles(for fileURL: URL, from root: FileNode) -> [FileNode]? {
         let parentURL = fileURL.deletingLastPathComponent().standardizedFileURL
         guard let parent = findDirectoryNode(for: parentURL, from: root) else { return nil }
-        let files = parent.children().filter { !$0.isDirectory }
+        let files = parent.children().filter { !$0.isDirectory && !$0.isPlaceholder }
         return files.isEmpty ? nil : files
     }
 
@@ -739,16 +928,18 @@ final class ProjectNavigatorView: NSView {
     @objc private func rowClicked() {
         let row = outlineView.clickedRow
         guard row >= 0, let node = outlineView.item(atRow: row) as? FileNode else { return }
+        guard !node.isPlaceholder else { return }
         if !node.isDirectory {
             previewFileURL = node.url.standardizedFileURL
-            onSelectFile?(node.url)
+            onSelectFile?(node.url, "sidebar.click")
         }
     }
 
     @objc private func rowDoubleClicked() {
         let row = outlineView.clickedRow
         guard row >= 0, let node = outlineView.item(atRow: row) as? FileNode else { return }
-        guard node.isDirectory, !node.children().isEmpty else { return }
+        guard !node.isPlaceholder else { return }
+        guard node.isDirectory else { return }
         if outlineView.isItemExpanded(node) {
             outlineView.collapseItem(node)
         } else {
@@ -793,6 +984,7 @@ extension ProjectNavigatorView: NSMenuDelegate {
         menu.removeAllItems()
         let row = outlineView.clickedRow
         guard row >= 0, let node = outlineView.item(atRow: row) as? FileNode else { return }
+        guard !node.isPlaceholder else { return }
         let url = node.url
 
         menu.addItem(makeMenuItem(title: "Show in Finder",
@@ -845,7 +1037,12 @@ extension ProjectNavigatorView: NSMenuDelegate {
 extension ProjectNavigatorView: NSOutlineViewDataSource {
 
     func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
-        if let node = item as? FileNode { return node.children().count }
+        if let node = item as? FileNode {
+            if node.isDirectory, node.cachedChildren == nil {
+                requestChildrenLoad(for: node, reloadParent: nil)
+            }
+            return node.children().count
+        }
         return rootNode == nil ? 0 : 1
     }
 
@@ -856,6 +1053,10 @@ extension ProjectNavigatorView: NSOutlineViewDataSource {
 
     func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
         guard let node = item as? FileNode else { return false }
+        if node.isDirectory, node.cachedChildren == nil {
+            requestChildrenLoad(for: node, reloadParent: nil)
+            return true
+        }
         return node.isDirectory && !node.children().isEmpty
     }
 }
@@ -900,9 +1101,11 @@ extension ProjectNavigatorView: NSOutlineViewDelegate {
         }
 
         cell.textField?.stringValue = node.displayName
-        let icon = NSWorkspace.shared.icon(forFile: node.url.path)
-        icon.size = NSSize(width: 16, height: 16)
-        cell.imageView?.image = icon
+        // Avoid NSWorkspace.icon(forFile:) here. On itfs/FUSE paths that call
+        // enters IconServices for every visible row during outline reloads and
+        // can stall the main thread. Generic template icons keep row creation
+        // deterministic and cheap.
+        cell.imageView?.image = node.isDirectory ? Self.folderIcon : Self.documentIcon
         return cell
     }
 
@@ -912,6 +1115,10 @@ extension ProjectNavigatorView: NSOutlineViewDelegate {
 
     func outlineViewItemDidExpand(_ notification: Notification) {
         // Newly-loaded subtree needs its own watcher.
+        if let node = notification.userInfo?["NSObject"] as? FileNode,
+           node.cachedChildren == nil {
+            requestChildrenLoad(for: node, reloadParent: nil)
+        }
         syncWatchers()
     }
 }
@@ -930,7 +1137,7 @@ private final class DirectoryWatcher {
 
         let source = DispatchSource.makeFileSystemObjectSource(
             fileDescriptor: fd,
-            eventMask: [.write, .extend, .delete, .rename, .revoke],
+            eventMask: [.write, .extend, .delete, .rename],
             queue: .main
         )
         source.setEventHandler { [weak self] in self?.scheduleChange() }
@@ -950,7 +1157,7 @@ private final class DirectoryWatcher {
         debounce?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.onChange() }
         debounce = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
     }
 
     func cancel() {

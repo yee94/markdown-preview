@@ -66,6 +66,18 @@ final class MarkdownWebView: NSView, WKNavigationDelegate {
     private var loadingFingerprint: RendererFingerprint?
     // Latest article HTML to swap in once the in-flight load reports ready.
     private var pendingArticleHTML: String?
+    // Full-page loads reset the JS global state. Track the native generation
+    // represented by the loaded HTML so didFinish can restore the JS guard
+    // before any stale fast-path update is allowed to touch the new page.
+    private var loadingPageGeneration: UInt64 = 0
+    private var activeTraceSelectionID: UInt64?
+    private var activeTraceURL: URL?
+    private var activeTraceTextHash: String?
+    private var activeTraceArticleHash: String?
+    private var pendingTraceSelectionID: UInt64?
+    private var pendingTraceURL: URL?
+    private var pendingTraceTextHash: String?
+    private var pendingTraceArticleHash: String?
     // Last unzoomed document height reported by the page (CSS pixels). Cached
     // so a pageZoom change can re-fire heightDidChange with the right scale
     // without waiting for JS to post a fresh value (it won't — scrollHeight
@@ -156,6 +168,8 @@ final class MarkdownWebView: NSView, WKNavigationDelegate {
         // kicking off a competing loadHTMLString.
         loadingFingerprint = fingerprint
         isLoadingFullPage = true
+        jsUpdateGeneration &+= 1
+        loadingPageGeneration = jsUpdateGeneration
         webView.loadHTMLString(rendered.html, baseURL: nil)
     }
 
@@ -178,26 +192,80 @@ final class MarkdownWebView: NSView, WKNavigationDelegate {
         scheduleArticleUpdate("window.MdPreview && MdPreview.update('');")
     }
 
-    private func scheduleArticleUpdate(_ javaScript: String) {
+    private func scheduleArticleUpdate(_ javaScript: String,
+                                       selectionID: UInt64? = nil,
+                                       fileURL: URL? = nil,
+                                       textHash: String? = nil,
+                                       articleHash: String? = nil) {
         jsUpdateGeneration &+= 1
         let generation = jsUpdateGeneration
-        webView.evaluateJavaScript(javaScript) { [weak self] _, _ in
-            guard let self, self.jsUpdateGeneration == generation else { return }
+        let guardedJavaScript = """
+        (() => {
+          const generation = \(generation);
+          if ((window.__mdPreviewNativeUpdateGeneration || 0) >= generation) {
+            return false;
+          }
+          window.__mdPreviewNativeUpdateGeneration = generation;
+          \(javaScript)
+          return true;
+        })();
+        """
+        webView.evaluateJavaScript(guardedJavaScript) { [weak self] _, error in
+            guard let self else { return }
+            guard self.jsUpdateGeneration == generation else {
+                PreviewDebugLog.event("webview.js.drop", [
+                    "selectionID": selectionID.map(String.init) ?? "nil",
+                    "reason": "stale-js-generation",
+                    "generation": generation,
+                    "currentGeneration": self.jsUpdateGeneration,
+                    "url": fileURL?.path ?? "nil"
+                ])
+                return
+            }
+            guard PreviewDebugLog.isEnabled else { return }
+            self.webView.evaluateJavaScript("(document.querySelector('article')||{}).innerHTML||''") { domHTML, _ in
+                let dom = domHTML as? String ?? ""
+                PreviewDebugLog.event("webview.js.done", [
+                    "selectionID": selectionID.map(String.init) ?? "nil",
+                    "url": fileURL?.path ?? "nil",
+                    "textHash": textHash ?? "nil",
+                    "articleHash": articleHash ?? "nil",
+                    "domChars": dom.count,
+                    "domHash": PreviewDebugLog.hash(dom),
+                    "error": error?.localizedDescription ?? "nil"
+                ])
+            }
         }
     }
 
-    func display(markdown: String, assetBaseURL: URL? = nil) {
+    func display(markdown: String,
+                 assetBaseURL: URL? = nil,
+                 selectionID: UInt64? = nil,
+                 fileURL: URL? = nil,
+                 textHash: String? = nil) {
         currentMarkdown = markdown
         assetScheme.setBaseURL(assetBaseURL)
         currentAssetBase = assetBaseURL
         let baseHref = "\(MarkdownAssetScheme.scheme):///"
         renderGeneration &+= 1
         let generation = renderGeneration
+        PreviewDebugLog.event("webview.display", [
+            "selectionID": selectionID.map(String.init) ?? "nil",
+            "url": fileURL?.path ?? "nil",
+            "chars": markdown.count,
+            "textHash": textHash ?? (PreviewDebugLog.isEnabled ? PreviewDebugLog.hash(markdown) : "disabled"),
+            "generation": generation,
+            "ready": isPageReady
+        ])
         Task { @concurrent [weak self] in
             let rendered = Self.timedRender(label: "display",
                                             markdown: markdown,
                                             assetBaseHref: baseHref)
-            await self?.applyDisplay(rendered, generation: generation)
+            await self?.applyDisplay(rendered,
+                                     generation: generation,
+                                     selectionID: selectionID,
+                                     fileURL: fileURL,
+                                     textHash: textHash ?? (PreviewDebugLog.isEnabled ? PreviewDebugLog.hash(markdown) : nil))
         }
     }
 
@@ -224,10 +292,31 @@ final class MarkdownWebView: NSView, WKNavigationDelegate {
     }
 
     private func applyDisplay(_ rendered: MarkdownHTML.RenderedHTML,
-                              generation: UInt64) {
+                              generation: UInt64,
+                              selectionID: UInt64?,
+                              fileURL: URL?,
+                              textHash: String?) {
         // A newer display() bumped the generation while this render was
         // off-main — drop the stale result so the latest article wins.
-        guard generation == renderGeneration else { return }
+        guard generation == renderGeneration else {
+            PreviewDebugLog.event("webview.render.drop", [
+                "selectionID": selectionID.map(String.init) ?? "nil",
+                "reason": "stale-render-generation",
+                "generation": generation,
+                "currentGeneration": renderGeneration,
+                "url": fileURL?.path ?? "nil"
+            ])
+            return
+        }
+        let articleHash = PreviewDebugLog.isEnabled ? PreviewDebugLog.hash(rendered.articleHTML) : nil
+        PreviewDebugLog.event("webview.render.finish", [
+            "selectionID": selectionID.map(String.init) ?? "nil",
+            "url": fileURL?.path ?? "nil",
+            "textHash": textHash ?? "nil",
+            "articleChars": rendered.articleHTML.count,
+            "articleHash": articleHash ?? "disabled",
+            "generation": generation
+        ])
         let fingerprint = RendererFingerprint(
             math: rendered.containsMath,
             mermaid: rendered.containsMermaid,
@@ -240,7 +329,11 @@ final class MarkdownWebView: NSView, WKNavigationDelegate {
         // bundles). The launch-time warmup loads both vendors, so any
         // subsequent file with any subset of renderers fast-paths into it.
         if isPageReady, let loaded = loadedFingerprint, loaded.covers(fingerprint) {
-            applyArticle(rendered.articleHTML)
+            applyArticle(rendered.articleHTML,
+                         selectionID: selectionID,
+                         fileURL: fileURL,
+                         textHash: textHash,
+                         articleHash: articleHash)
             return
         }
 
@@ -252,22 +345,54 @@ final class MarkdownWebView: NSView, WKNavigationDelegate {
         // didFinish will swap it in.
         if isLoadingFullPage, let loading = loadingFingerprint, loading.covers(fingerprint) {
             pendingArticleHTML = rendered.articleHTML
+            pendingTraceSelectionID = selectionID
+            pendingTraceURL = fileURL
+            pendingTraceTextHash = textHash
+            pendingTraceArticleHash = articleHash
+            PreviewDebugLog.event("webview.render.queue", [
+                "selectionID": selectionID.map(String.init) ?? "nil",
+                "url": fileURL?.path ?? "nil",
+                "articleHash": articleHash ?? "disabled"
+            ])
             return
         }
 
         // Slow path: (re)load the full page.
         pendingArticleHTML = nil
+        pendingTraceSelectionID = nil
+        pendingTraceURL = nil
+        pendingTraceTextHash = nil
+        pendingTraceArticleHash = nil
         loadingFingerprint = fingerprint
         isLoadingFullPage = true
         isPageReady = false
+        jsUpdateGeneration &+= 1
+        loadingPageGeneration = jsUpdateGeneration
+        activeTraceSelectionID = selectionID
+        activeTraceURL = fileURL
+        activeTraceTextHash = textHash
+        activeTraceArticleHash = articleHash
+        PreviewDebugLog.event("webview.load.full", [
+            "selectionID": selectionID.map(String.init) ?? "nil",
+            "url": fileURL?.path ?? "nil",
+            "articleHash": articleHash ?? "disabled"
+        ])
         webView.loadHTMLString(rendered.html, baseURL: nil)
         loadedFingerprint = fingerprint
     }
 
     /// Swaps the article body in-place via JS (fast-path render).
-    private func applyArticle(_ articleHTML: String) {
+    private func applyArticle(_ articleHTML: String,
+                              selectionID: UInt64? = nil,
+                              fileURL: URL? = nil,
+                              textHash: String? = nil,
+                              articleHash: String? = nil) {
         let payload = javaScriptStringLiteral(articleHTML)
-        scheduleArticleUpdate("window.MdPreview && MdPreview.update(\(payload));")
+        scheduleArticleUpdate("window.MdPreview && MdPreview.update(\(payload));",
+                              selectionID: selectionID,
+                              fileURL: fileURL,
+                              textHash: textHash,
+                              articleHash: articleHash ?? (PreviewDebugLog.isEnabled ? PreviewDebugLog.hash(articleHTML) : nil))
     }
 
     func reloadPreview() {
@@ -801,19 +926,65 @@ final class MarkdownWebView: NSView, WKNavigationDelegate {
         neutralizeWebKitScrollEdgeInsets()
         isPageReady = true
         isLoadingFullPage = false
+        let loadedPageGeneration = loadingPageGeneration
+        webView.evaluateJavaScript("""
+        window.__mdPreviewNativeUpdateGeneration = Math.max(
+          window.__mdPreviewNativeUpdateGeneration || 0,
+          \(loadedPageGeneration)
+        );
+        """)
+        if PreviewDebugLog.isEnabled {
+            let selectionID = activeTraceSelectionID
+            let fileURL = activeTraceURL
+            let textHash = activeTraceTextHash
+            let articleHash = activeTraceArticleHash
+            webView.evaluateJavaScript("(document.querySelector('article')||{}).innerHTML||''") { domHTML, _ in
+                let dom = domHTML as? String ?? ""
+                PreviewDebugLog.event("webview.load.didFinish", [
+                    "selectionID": selectionID.map(String.init) ?? "nil",
+                    "url": fileURL?.path ?? "nil",
+                    "textHash": textHash ?? "nil",
+                    "articleHash": articleHash ?? "nil",
+                    "domChars": dom.count,
+                    "domHash": PreviewDebugLog.hash(dom)
+                ])
+            }
+        }
         // Apply the freshest article that arrived while the page was loading.
         if let pending = pendingArticleHTML {
             pendingArticleHTML = nil
-            applyArticle(pending)
+            let selectionID = pendingTraceSelectionID
+            let fileURL = pendingTraceURL
+            let textHash = pendingTraceTextHash
+            let articleHash = pendingTraceArticleHash
+            pendingTraceSelectionID = nil
+            pendingTraceURL = nil
+            pendingTraceTextHash = nil
+            pendingTraceArticleHash = nil
+            applyArticle(pending,
+                         selectionID: selectionID,
+                         fileURL: fileURL,
+                         textHash: textHash,
+                         articleHash: articleHash)
         }
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         isLoadingFullPage = false
+        PreviewDebugLog.event("webview.load.fail", [
+            "selectionID": activeTraceSelectionID.map(String.init) ?? "nil",
+            "url": activeTraceURL?.path ?? "nil",
+            "error": error.localizedDescription
+        ])
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         isLoadingFullPage = false
+        PreviewDebugLog.event("webview.load.failProvisional", [
+            "selectionID": activeTraceSelectionID.map(String.init) ?? "nil",
+            "url": activeTraceURL?.path ?? "nil",
+            "error": error.localizedDescription
+        ])
     }
 
     private func sameDocumentFragmentID(from url: URL) -> String? {

@@ -15,6 +15,7 @@ extension NSToolbarItem.Identifier {
     static let share = NSToolbarItem.Identifier("Share")
     static let search = NSToolbarItem.Identifier("Search")
     static let sidebarMenu = NSToolbarItem.Identifier("SidebarMenu")
+    static let refreshFileTree = NSToolbarItem.Identifier("RefreshFileTree")
     static let printDocument = NSToolbarItem.Identifier("PrintDocument")
     static let copyMarkdown = NSToolbarItem.Identifier("CopyMarkdown")
     static let zoom = NSToolbarItem.Identifier("Zoom")
@@ -85,8 +86,8 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
         documentWindow.styleMask.insert(.fullSizeContentView)
         documentWindow.delegate = self
         let split = MainSplitViewController()
-        split.onSelectFile = { [weak self] url in
-            self?.present(url: url)
+        split.onSelectFile = { [weak self] url, source in
+            self?.present(url: url, source: source)
         }
         documentWindow.contentViewController = split
         documentWindow.setContentSize(NSSize(width: 1100, height: 720))
@@ -137,6 +138,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
     }
 
     func display(markdown: String, fileURL: URL?) {
+        let selectionID = beginSelection(url: fileURL, source: "document.display")
         currentFileURL = fileURL
         currentMarkdown = markdown
         if fileURL != nil {
@@ -149,18 +151,19 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
         refreshOpenInLLMItem()
         if let fileURL {
             NSDocumentController.shared.noteNewRecentDocumentURL(fileURL)
-            renderCurrentDocument(text: markdown, fileURL: fileURL)
+            renderCurrentDocument(text: markdown, fileURL: fileURL, selectionID: selectionID)
             startWatching(fileURL)
             offerToBecomeDefaultHandlerIfNeeded()
         }
     }
 
-    private func present(url: URL) {
+    private func present(url: URL, source: String = "present") {
         if url.isExistingDirectory {
             openFolder(url)
             return
         }
 
+        let selectionID = beginSelection(url: url, source: source)
         // Keep the previous doc visible until the new one loads. Cloud /
         // network volumes often return empty reads on reload after idle.
         currentFileURL = url
@@ -171,7 +174,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
         NSDocumentController.shared.noteNewRecentDocumentURL(url)
         refreshOpenWithItem()
         refreshOpenInLLMItem()
-        loadFile(at: url)
+        loadFile(at: url, selectionID: selectionID)
         startWatching(url)
         offerToBecomeDefaultHandlerIfNeeded()
     }
@@ -180,7 +183,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
         fileWatcher?.cancel()
         let watcher = FileWatcher(url: url) { [weak self] in
             guard let self, self.currentFileURL == url else { return }
-            self.loadFile(at: url, silentOnFailure: true)
+            self.loadFile(at: url, silentOnFailure: true, selectionID: self.currentSelectionID)
         }
         watcher.onRename = { [weak self] newURL in
             self?.handleRename(to: newURL)
@@ -204,7 +207,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
             (documentWindow.contentViewController as? MainSplitViewController)?
                 .openFileURLDidChange(newURL, markdown: markdown)
         } else {
-            loadFile(at: newURL, silentOnFailure: true)
+            loadFile(at: newURL, silentOnFailure: true, selectionID: currentSelectionID)
         }
     }
 
@@ -236,6 +239,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
         var identifiers: [NSToolbarItem.Identifier] = [
             .flexibleSpace,
+            .refreshFileTree,
             .sidebarMenu,
             .sidebarTrackingSeparator,
             .openWith,
@@ -253,6 +257,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
         var identifiers: [NSToolbarItem.Identifier] = [
+            .refreshFileTree,
             .sidebarMenu,
             .sidebarTrackingSeparator,
             .flexibleSpace,
@@ -275,6 +280,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
                  itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
                  willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
         switch itemIdentifier {
+        case .refreshFileTree: return makeRefreshFileTreeItem()
         case .sidebarMenu: return makeSidebarMenuItem(willBeInsertedIntoToolbar: flag)
         case .openWith: return makeOpenWithItem()
         case .openInLLM:
@@ -399,9 +405,22 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
         return image
     }
 
+    private func makeRefreshFileTreeItem() -> NSToolbarItem {
+        let item = NSToolbarItem(itemIdentifier: .refreshFileTree)
+        item.label = "Refresh"
+        item.paletteLabel = "Refresh File Tree"
+        item.toolTip = "Refresh the project navigator"
+        item.image = NSImage(systemSymbolName: "arrow.clockwise",
+                             accessibilityDescription: "Refresh")
+        item.target = self
+        item.action = #selector(refreshFileTreeFromToolbar(_:))
+        return item
+    }
+
     @objc func toggleSidebarFromMenu(_ sender: Any?) {
         (documentWindow.contentViewController as? MainSplitViewController)?.toggleSidebar()
         syncSidebarMenuState()
+        documentWindow.toolbar?.validateVisibleItems()
     }
 
     @objc func hideSidebarFromMenu(_ sender: Any?) {
@@ -409,6 +428,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
               split.isSidebarVisible else { return }
         split.toggleSidebar()
         syncSidebarMenuState()
+        documentWindow.toolbar?.validateVisibleItems()
     }
 
     @objc func selectOutlineMode(_ sender: Any?) {
@@ -416,6 +436,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
         split.setSidebarMode(.outline)
         split.showSidebar()
         syncSidebarMenuState()
+        documentWindow.toolbar?.validateVisibleItems()
     }
 
     @objc func selectFilesMode(_ sender: Any?) {
@@ -423,11 +444,23 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
         split.setSidebarMode(.files)
         split.showSidebar()
         syncSidebarMenuState()
+        documentWindow.toolbar?.validateVisibleItems()
+    }
+
+    @objc private func refreshFileTreeFromToolbar(_ sender: Any?) {
+        guard let split = documentWindow.contentViewController as? MainSplitViewController else { return }
+        split.refreshProjectNavigator()
     }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         syncSidebarMenuState()
         return true
+    }
+
+    func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
+        guard item.itemIdentifier == .refreshFileTree else { return true }
+        let state = currentSidebarMenuState()
+        return state.sidebarVisible && state.mode == .files
     }
 
     private func makeInspectorItem() -> NSToolbarItem {
@@ -1294,6 +1327,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
         documentWindow.makeKeyAndOrderFront(nil)
         NSApp.activate()
         syncSidebarMenuState()
+        documentWindow.toolbar?.validateVisibleItems()
     }
 
     func contextMenuEditorItems(for fileURL: URL) -> [NSMenuItem] {
@@ -1382,35 +1416,81 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
     /// Latest in-flight load. Cancelled when a newer file is requested so
     /// rapid clicks don't pile up superseded reads.
     private var loadTask: Task<Void, Never>?
+    private var currentSelectionID: UInt64 = 0
 
     private static let fileReadTimeoutSeconds: TimeInterval = 8
 
     private struct ReadTimeout: Error {}
 
-    private func loadFile(at url: URL, silentOnFailure: Bool = false, attempt: Int = 0) {
-        PreviewDebugLog.write("loadFile START file=\(url.lastPathComponent) silent=\(silentOnFailure) attempt=\(attempt)")
+    private func beginSelection(url: URL?, source: String) -> UInt64 {
+        currentSelectionID &+= 1
+        let selectionID = currentSelectionID
+        PreviewDebugLog.event("select", [
+            "selectionID": selectionID,
+            "source": source,
+            "url": url?.path ?? "nil",
+            "standardizedURL": url?.standardizedFileURL.path ?? "nil",
+            "currentURL": currentFileURL?.path ?? "nil"
+        ])
+        return selectionID
+    }
+
+    private func loadFile(at url: URL,
+                          silentOnFailure: Bool = false,
+                          attempt: Int = 0,
+                          selectionID: UInt64? = nil) {
+        let selectionID = selectionID ?? currentSelectionID
+        PreviewDebugLog.event("read.request", [
+            "selectionID": selectionID,
+            "url": url.path,
+            "standardizedURL": url.standardizedFileURL.path,
+            "currentURL": currentFileURL?.path ?? "nil",
+            "silent": silentOnFailure,
+            "attempt": attempt
+        ])
         loadTask?.cancel()
         let queue = fileReadQueue
         loadTask = Task { [weak self] in
             do {
-                let text = try await Self.readMarkdown(at: url, on: queue)
+                let text = try await Self.readMarkdown(at: url, on: queue, selectionID: selectionID)
                 if Task.isCancelled {
-                    PreviewDebugLog.write("loadFile CANCELLED file=\(url.lastPathComponent)")
+                    PreviewDebugLog.event("read.cancelled", [
+                        "selectionID": selectionID,
+                        "url": url.path
+                    ])
                     return
                 }
-                PreviewDebugLog.write("loadFile OK file=\(url.lastPathComponent) chars=\(text.count)")
-                self?.applyLoadedMarkdown(text, fileURL: url)
+                PreviewDebugLog.event("read.complete", [
+                    "selectionID": selectionID,
+                    "url": url.path,
+                    "chars": text.count,
+                    "textHash": PreviewDebugLog.isEnabled ? PreviewDebugLog.hash(text) : "disabled"
+                ])
+                self?.applyLoadedMarkdown(text, fileURL: url, selectionID: selectionID)
             } catch is TransientEmptyRead {
-                PreviewDebugLog.write("loadFile TRANSIENT-EMPTY file=\(url.lastPathComponent)")
+                PreviewDebugLog.event("read.transient_empty", [
+                    "selectionID": selectionID,
+                    "url": url.path
+                ])
                 self?.handleTransientEmptyRead(at: url,
                                                silentOnFailure: silentOnFailure,
-                                               attempt: attempt)
+                                               attempt: attempt,
+                                               selectionID: selectionID)
             } catch is ReadTimeout {
-                PreviewDebugLog.write("loadFile TIMEOUT file=\(url.lastPathComponent)")
+                PreviewDebugLog.event("read.timeout", [
+                    "selectionID": selectionID,
+                    "url": url.path
+                ])
                 self?.handleTransientEmptyRead(at: url,
                                                silentOnFailure: silentOnFailure,
-                                               attempt: attempt)
+                                               attempt: attempt,
+                                               selectionID: selectionID)
             } catch {
+                PreviewDebugLog.event("read.error", [
+                    "selectionID": selectionID,
+                    "url": url.path,
+                    "error": error.localizedDescription
+                ])
                 // Wrap as NSError (Sendable) so the original presentation —
                 // localizedDescription + recovery suggestion — survives the
                 // hop back to MainActor.
@@ -1430,30 +1510,60 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
     /// a timeout. A hung FUSE read is abandoned after `fileReadTimeoutSeconds`
     /// so the serial queue slot frees up for the next file the user picks.
     private nonisolated static func readMarkdown(at url: URL,
-                                                 on queue: DispatchQueue) async throws -> String {
+                                                 on queue: DispatchQueue,
+                                                 selectionID: UInt64) async throws -> String {
         try await withCheckedThrowingContinuation { continuation in
             queue.async {
+                let started = DispatchTime.now()
+                PreviewDebugLog.event("read.start", [
+                    "selectionID": selectionID,
+                    "url": url.path,
+                    "standardizedURL": url.standardizedFileURL.path
+                ])
                 let group = DispatchGroup()
-                var readResult: Result<String, Error>?
+                let readResult = ReadResultBox()
                 group.enter()
                 DispatchQueue.global(qos: .userInitiated).async {
                     defer { group.leave() }
-                    readResult = Result { try readMarkdown(at: url) }
+                    readResult.set(Result { try readMarkdown(at: url) })
                 }
                 if group.wait(timeout: .now() + fileReadTimeoutSeconds) == .timedOut {
+                    PreviewDebugLog.event("read.timeout.inner", [
+                        "selectionID": selectionID,
+                        "url": url.path,
+                        "durationMs": elapsedMilliseconds(since: started)
+                    ])
                     continuation.resume(throwing: ReadTimeout())
                     return
                 }
-                switch readResult {
+                switch readResult.get() {
                 case .success(let text):
+                    PreviewDebugLog.event("read.finish", [
+                        "selectionID": selectionID,
+                        "url": url.path,
+                        "chars": text.count,
+                        "textHash": PreviewDebugLog.isEnabled ? PreviewDebugLog.hash(text) : "disabled",
+                        "durationMs": elapsedMilliseconds(since: started)
+                    ])
                     continuation.resume(returning: text)
                 case .failure(let error):
+                    PreviewDebugLog.event("read.finish_error", [
+                        "selectionID": selectionID,
+                        "url": url.path,
+                        "error": error.localizedDescription,
+                        "durationMs": elapsedMilliseconds(since: started)
+                    ])
                     continuation.resume(throwing: error)
                 case .none:
                     continuation.resume(throwing: ReadTimeout())
                 }
             }
         }
+    }
+
+    private nonisolated static func elapsedMilliseconds(since start: DispatchTime) -> Int {
+        Int((Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds)
+             / 1_000_000).rounded())
     }
 
     private nonisolated static func readMarkdown(at url: URL) throws -> String {
@@ -1464,7 +1574,10 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
         return text
     }
 
-    private func handleTransientEmptyRead(at url: URL, silentOnFailure: Bool, attempt: Int) {
+    private func handleTransientEmptyRead(at url: URL,
+                                          silentOnFailure: Bool,
+                                          attempt: Int,
+                                          selectionID: UInt64) {
         guard currentFileURL == url else { return }
         // Watcher-driven reload after idle: keep showing the last good doc.
         if silentOnFailure, let existing = currentMarkdown, !existing.isEmpty {
@@ -1485,20 +1598,57 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
         let delay = 0.5 * Double(attempt + 1)
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self, self.currentFileURL == url else { return }
-            self.loadFile(at: url, silentOnFailure: silentOnFailure, attempt: attempt + 1)
+            self.loadFile(at: url,
+                          silentOnFailure: silentOnFailure,
+                          attempt: attempt + 1,
+                          selectionID: selectionID)
         }
     }
 
-    private func applyLoadedMarkdown(_ text: String, fileURL: URL) {
-        guard currentFileURL == fileURL else { return }
-        // Same blip can slip through without raising; never clobber a good doc.
-        if text.isEmpty, let existing = currentMarkdown, !existing.isEmpty {
+    private func applyLoadedMarkdown(_ text: String, fileURL: URL, selectionID: UInt64) {
+        guard currentSelectionID == selectionID else {
+            PreviewDebugLog.event("apply.drop", [
+                "selectionID": selectionID,
+                "reason": "stale-selection",
+                "currentSelectionID": currentSelectionID,
+                "url": fileURL.path,
+                "currentURL": currentFileURL?.path ?? "nil"
+            ])
             return
         }
+        guard currentFileURL == fileURL else {
+            PreviewDebugLog.event("apply.drop", [
+                "selectionID": selectionID,
+                "reason": "url-mismatch",
+                "url": fileURL.path,
+                "currentURL": currentFileURL?.path ?? "nil"
+            ])
+            return
+        }
+        // Same blip can slip through without raising; never clobber a good doc.
+        if text.isEmpty, let existing = currentMarkdown, !existing.isEmpty {
+            PreviewDebugLog.event("apply.drop", [
+                "selectionID": selectionID,
+                "reason": "empty-guard",
+                "url": fileURL.path,
+                "existingChars": existing.count
+            ])
+            return
+        }
+        let textHash = PreviewDebugLog.isEnabled ? PreviewDebugLog.hash(text) : nil
+        PreviewDebugLog.event("apply.accept", [
+            "selectionID": selectionID,
+            "url": fileURL.path,
+            "chars": text.count,
+            "textHash": textHash ?? "disabled"
+        ])
         currentMarkdown = text
         refreshOpenInLLMItem()
         markdownDocument?.replaceContents(markdown: text, fileURL: fileURL)
-        renderCurrentDocument(text: text, fileURL: fileURL)
+        renderCurrentDocument(text: text,
+                              fileURL: fileURL,
+                              selectionID: selectionID,
+                              textHash: textHash)
     }
 
     private func applyLoadFailure(error: NSError, fileURL: URL, silentOnFailure: Bool) {
@@ -1507,12 +1657,24 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
         NSAlert(error: error).beginSheetModal(for: documentWindow)
     }
 
-    private func renderCurrentDocument(text: String, fileURL: URL) {
+    private func renderCurrentDocument(text: String,
+                                       fileURL: URL,
+                                       selectionID: UInt64,
+                                       textHash: String? = nil) {
+        let textHash = textHash ?? (PreviewDebugLog.isEnabled ? PreviewDebugLog.hash(text) : nil)
+        PreviewDebugLog.event("render.dispatch", [
+            "selectionID": selectionID,
+            "url": fileURL.path,
+            "chars": text.count,
+            "textHash": textHash ?? "disabled"
+        ])
         (documentWindow.contentViewController as? MainSplitViewController)?
             .display(markdown: text,
                      fileName: fileURL.lastPathComponent,
                      url: fileURL,
-                     assetBaseURL: fileURL.deletingLastPathComponent())
+                     assetBaseURL: fileURL.deletingLastPathComponent(),
+                     selectionID: selectionID,
+                     textHash: textHash)
     }
 
     private func addBottomTitlebarAccessory(
@@ -1528,6 +1690,23 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
         return accessory
     }
 
+}
+
+private final class ReadResultBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Result<String, Error>?
+
+    func set(_ value: Result<String, Error>) {
+        lock.lock()
+        self.value = value
+        lock.unlock()
+    }
+
+    func get() -> Result<String, Error>? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
 }
 
 private final class FileWatcher {

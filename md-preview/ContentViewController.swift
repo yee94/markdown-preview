@@ -114,9 +114,17 @@ final class ContentViewController: NSViewController {
         applyDocumentHeight()
     }
 
-    func display(markdown: String, assetBaseURL: URL? = nil) {
+    func display(markdown: String,
+                 assetBaseURL: URL? = nil,
+                 selectionID: UInt64? = nil,
+                 fileURL: URL? = nil,
+                 textHash: String? = nil) {
         resetScrollspy()
-        webView.display(markdown: markdown, assetBaseURL: assetBaseURL)
+        webView.display(markdown: markdown,
+                        assetBaseURL: assetBaseURL,
+                        selectionID: selectionID,
+                        fileURL: fileURL,
+                        textHash: textHash)
         scheduleHeadingOffsetsRefresh()
     }
 

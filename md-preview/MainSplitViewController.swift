@@ -9,7 +9,7 @@ final class MainSplitViewController: NSSplitViewController {
 
     private static let didSeedKey = "MainSplitView.didSeedInitialState"
 
-    var onSelectFile: ((URL) -> Void)?
+    var onSelectFile: ((URL, String) -> Void)?
 
     private let previewViewController = ContentViewController()
 
@@ -22,8 +22,8 @@ final class MainSplitViewController: NSSplitViewController {
             self?.previewViewController.markHeadingActiveFromClick(index)
             self?.previewViewController.scrollToHeading(index: index)
         }
-        sidebarVC.onSelectFile = { [weak self] url in
-            self?.onSelectFile?(url)
+        sidebarVC.onSelectFile = { [weak self] url, source in
+            self?.onSelectFile?(url, source)
         }
         let sidebar = NSSplitViewItem(sidebarWithViewController: sidebarVC)
         sidebar.minimumThickness = 180
@@ -52,8 +52,17 @@ final class MainSplitViewController: NSSplitViewController {
         }
     }
 
-    func display(markdown: String, fileName: String, url: URL?, assetBaseURL: URL?) {
-        previewViewController.display(markdown: markdown, assetBaseURL: assetBaseURL)
+    func display(markdown: String,
+                 fileName: String,
+                 url: URL?,
+                 assetBaseURL: URL?,
+                 selectionID: UInt64? = nil,
+                 textHash: String? = nil) {
+        previewViewController.display(markdown: markdown,
+                                      assetBaseURL: assetBaseURL,
+                                      selectionID: selectionID,
+                                      fileURL: url,
+                                      textHash: textHash)
         sidebarViewController?.display(markdown: markdown, fileName: fileName, fileURL: url)
         inspectorViewController?.display(metadata: DocumentMetadata.make(url: url, markdown: markdown))
     }
@@ -144,6 +153,10 @@ final class MainSplitViewController: NSSplitViewController {
 
     func setSidebarMode(_ mode: SidebarViewController.Mode) {
         sidebarViewController?.setMode(mode)
+    }
+
+    func refreshProjectNavigator() {
+        sidebarViewController?.refreshProjectNavigator()
     }
 
     private var sidebarViewController: SidebarViewController? {
