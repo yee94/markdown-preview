@@ -5,6 +5,9 @@
 
 import Foundation
 import Markdown
+#if canImport(BeautifulMermaid)
+import BeautifulMermaid
+#endif
 
 // Pure string transforms — no UI state — so the whole namespace runs off
 // the main actor. This lets MarkdownWebView.display dispatch the render
@@ -27,29 +30,34 @@ nonisolated enum MarkdownHTML {
         let articleHTML: String
         let containsMath: Bool
         let containsMermaid: Bool
+        let containsNativeMermaid: Bool
         let containsCode: Bool
     }
 
     static func makeHTML(from markdown: String,
-                         allowsScroll: Bool = false,
-                         assetBaseHref: String? = nil,
-                         vendorLoading: VendorLoading = .inline) -> String {
+                          allowsScroll: Bool = false,
+                          assetBaseHref: String? = nil,
+                          vendorLoading: VendorLoading = .inline,
+                          darkMode: Bool = false) -> String {
         render(markdown: markdown,
                allowsScroll: allowsScroll,
                assetBaseHref: assetBaseHref,
-               vendorLoading: vendorLoading).html
+               vendorLoading: vendorLoading,
+               darkMode: darkMode).html
     }
 
     static func render(markdown: String,
                        allowsScroll: Bool = false,
                        assetBaseHref: String? = nil,
                        vendorLoading: VendorLoading = .inline,
-                       warmup: Bool = false) -> RenderedHTML {
+                       warmup: Bool = false,
+                       darkMode: Bool = false) -> RenderedHTML {
         let body = MarkdownFrontmatter.split(markdown).body
         let footnotes = extractFootnotes(from: body)
         let math = extractMath(from: footnotes.markdown)
         let formatted = EscapingHTMLFormatter.format(math.processedMarkdown)
-        let mermaidResult = renderMermaidBlocks(in: formatted)
+        let nativeMermaidResult = renderNativeMermaidBlocks(in: formatted, darkMode: darkMode)
+        let mermaidResult = renderMermaidBlocks(in: nativeMermaidResult.html)
         let mathResult = renderMathBlocks(in: mermaidResult.html, with: math)
         let footnoteReferenceHTML = renderFootnoteReferences(in: mathResult.html, with: footnotes)
         let footnoteDefinitions = renderFootnoteDefinitions(footnotes)
@@ -57,6 +65,7 @@ nonisolated enum MarkdownHTML {
         let bodyHTML = injectRTLDirection(in: headingsHTML)
         let containsMath = mathResult.containsMath || footnoteDefinitions.containsMath
         let containsMermaid = mermaidResult.containsMermaid || footnoteDefinitions.containsMermaid
+        let containsNativeMermaid = nativeMermaidResult.containsNativeMermaid
         let containsCode = detectHighlightableCode(in: bodyHTML)
         let scrollOverride = allowsScroll ? """
         <style>
@@ -109,6 +118,7 @@ nonisolated enum MarkdownHTML {
             articleHTML: bodyHTML,
             containsMath: containsMath,
             containsMermaid: containsMermaid,
+            containsNativeMermaid: containsNativeMermaid,
             containsCode: containsCode
         )
     }
@@ -956,8 +966,25 @@ nonisolated enum MarkdownHTML {
                           'embed', 'meta', 'link', 'base'],
             FORBID_ATTR: ['style'],
             ADD_ATTR: ['target'],
+            ADD_TAGS: ['svg', 'g', 'path', 'rect', 'circle', 'ellipse', 'line', 'polyline', 'polygon', 'text', 'defs', 'marker', 'use', 'foreignObject'],
             ALLOWED_URI_REGEXP: /^(?:(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|xmpp|matrix|md-asset):|[^a-z]|[a-z+.\\-]+(?:[^a-z+.\\-:]|$))/i
         };
+
+        // Preserve <style> elements and inline style attributes that live
+        // inside an SVG (BeautifulMermaid renders diagrams as SVG). The hook
+        // checks the parent chain; all other style nodes/attrs remain stripped.
+        if (typeof DOMPurify !== 'undefined' && DOMPurify.addHook) {
+            DOMPurify.addHook('uponSanitizeElement', (node, data) => {
+                if (data.tagName === 'style' && node.parentNode && node.parentNode.closest('svg')) {
+                    data.allowedTags['style'] = true;
+                }
+            });
+            DOMPurify.addHook('uponSanitizeAttribute', (node, data) => {
+                if (data.attrName === 'style' && node.closest('svg')) {
+                    data.forceKeepAttr = true;
+                }
+            });
+        }
 
         function sanitize(html) {
             if (typeof html !== 'string') return '';
@@ -1170,20 +1197,20 @@ nonisolated enum MarkdownHTML {
 
     private static func replaceMatches(of regex: NSRegularExpression,
                                        in source: String,
-                                       transform: (String) -> String) -> String {
+                                       transform: (String) -> String?) -> String {
         rewrite(matchesOf: regex, in: source, captureGroup: 1, transform: transform)
     }
 
     private static func replaceFullMatches(of regex: NSRegularExpression,
                                            in source: String,
-                                           transform: (String) -> String) -> String {
+                                           transform: (String) -> String?) -> String {
         rewrite(matchesOf: regex, in: source, captureGroup: 0, transform: transform)
     }
 
     private static func rewrite(matchesOf regex: NSRegularExpression,
                                 in source: String,
                                 captureGroup: Int,
-                                transform: (String) -> String) -> String {
+                                transform: (String) -> String?) -> String {
         let nsSource = source as NSString
         let matches = regex.matches(
             in: source,
@@ -1198,7 +1225,12 @@ nonisolated enum MarkdownHTML {
                 location: cursor,
                 length: match.range.location - cursor
             ))
-            result += transform(nsSource.substring(with: match.range(at: captureGroup)))
+            let original = nsSource.substring(with: match.range(at: captureGroup))
+            if let replacement = transform(original) {
+                result += replacement
+            } else {
+                result += nsSource.substring(with: match.range)
+            }
             cursor = match.range.location + match.range.length
         }
         result += nsSource.substring(from: cursor)
@@ -1216,6 +1248,22 @@ nonisolated enum MarkdownHTML {
             case "\"": out += "&quot;"
             default: out.append(ch)
             }
+        }
+        return out
+    }
+
+    private static func htmlUnescape(_ string: String) -> String {
+        var out = string
+        let entities: [(String, Character)] = [
+            ("&amp;", "&"),
+            ("&lt;", "<"),
+            ("&gt;", ">"),
+            ("&quot;", "\""),
+            ("&#39;", "'"),
+            ("&#x27;", "'")
+        ]
+        for (entity, char) in entities {
+            out = out.replacingOccurrences(of: entity, with: String(char))
         }
         return out
     }
@@ -1324,12 +1372,405 @@ nonisolated enum MarkdownHTML {
         let containsMermaid: Bool
     }
 
+    private struct NativeMermaidRenderResult {
+        let html: String
+        let containsNativeMermaid: Bool
+    }
+
     private static let mermaidRegex: NSRegularExpression = {
         // swiftlint:disable:next force_try
         try! NSRegularExpression(
             pattern: #"<pre><code class="language-mermaid">([\s\S]*?)</code></pre>"#
         )
     }()
+
+    /// Diagram types supported by BeautifulMermaid. Any other Mermaid diagram
+    /// (gitGraph, gantt, pie, mindmap, etc.) is left untouched so the bundled
+    /// mermaid.min.js can render it via the fallback path.
+    private static let nativeMermaidDiagramPrefixes: [String] = [
+        "flowchart",
+        "graph",
+        "sequenceDiagram",
+        "classDiagram",
+        "erDiagram",
+        "stateDiagram",
+        "xychart"
+    ]
+
+    private static let nativeMermaidSVGTagRegex: NSRegularExpression = {
+        // swiftlint:disable:next force_try
+        try! NSRegularExpression(pattern: #"<svg\b[^>]*>"#, options: [.caseInsensitive])
+    }()
+
+    private static let nativeMermaidMalformedColorRegex: NSRegularExpression = {
+        // swiftlint:disable:next force_try
+        try! NSRegularExpression(
+            pattern: #"(#[0-9A-Fa-f]{6})\s+\d+%,\s*#[0-9A-Fa-f]{6}\)\)"#,
+            options: [.caseInsensitive]
+        )
+    }()
+
+    /// Broken colour literals BeautifulMermaid's partial CSS-var resolver can
+    /// leave in inline SVG attributes after `color-mix()` substitution fails.
+    private static let nativeMermaidBrokenColorValuePattern =
+        #"(?:#[0-9A-Fa-f]{3,8}\s+\d+%?,\s*#[0-9A-Fa-f]{3,8}\)\)|color-mix\([^)]*\))"#
+
+    private static let nativeMermaidMultilineLabelRegex: NSRegularExpression = {
+        // BeautifulMermaid currently misparses flowchart node labels that span
+        // multiple source lines, so those diagrams stay on the JS fallback.
+        // swiftlint:disable:next force_try
+        try! NSRegularExpression(pattern: #"\[[^\]]*\n[^\]]*\]"#)
+     }()
+
+#if canImport(BeautifulMermaid)
+    /// Native Mermaid always renders with the dark palette — independent of
+    /// the article's light/dark appearance or the JS mermaid fallback theme.
+    private static func mermaidTheme(darkMode: Bool) -> DiagramTheme {
+        _ = darkMode
+        return .githubDark
+    }
+
+    // MARK: - SVG colour helpers (native Mermaid)
+
+    /// Convert a BMColor to a lowercase 6-digit hex string.
+    /// Uses BMColor.hexString (provided by BeautifulMermaid) which handles
+    /// AppKit/UIKit differences internally.
+    private static func mermaidHex(_ color: BMColor) -> String {
+        color.hexString.lowercased()
+    }
+
+    /// Semantic colours aligned with Mermaid.js built-in themes (default / dark),
+    /// so native SVG output matches https://mermaid.live rather than
+    /// BeautifulMermaid's partial `color-mix()` residue or its `#666666`
+    /// unresolved-`var()` fallback.
+    private struct MermaidSemanticColors {
+        let text: String
+        let textSec: String
+        let textMuted: String
+        let textFaint: String
+        let line: String
+        let arrow: String
+        let nodeFill: String
+        let nodeStroke: String
+        let groupFill: String
+        let groupHdr: String
+        let innerStroke: String
+        let keyBadge: String
+        let noteFill: String
+        let noteStroke: String
+        let activationFill: String
+        let activationStroke: String
+        let bg: String
+        let surface: String
+        let border: String
+        let accent: String
+        let muted: String
+    }
+
+    /// Palette tokens from Mermaid.js `themeVariables` (dark). Native Mermaid
+    /// always uses this palette regardless of the host appearance.
+    private static func mermaidSemanticColors(darkMode: Bool) -> MermaidSemanticColors {
+        _ = darkMode
+        return MermaidSemanticColors(
+            text: "#e6edf3",
+            textSec: "#e6edf3",
+            textMuted: "#8b949e",
+            textFaint: "#6e7681",
+            line: "#8b949e",
+            arrow: "#e6edf3",
+            nodeFill: "#2d333b",
+            nodeStroke: "#81b1db",
+            groupFill: "#161b22",
+            groupHdr: "#2d333b",
+            innerStroke: "#8b949e",
+            keyBadge: "#3d444d",
+            noteFill: "#3d2f00",
+            noteStroke: "#9e6a03",
+            activationFill: "#21262d",
+            activationStroke: "#8b949e",
+            bg: "#0d1117",
+            surface: "#2d333b",
+            border: "#81b1db",
+            accent: "#4493f8",
+            muted: "#8b949e"
+        )
+    }
+
+    /// Build a flat map of every CSS variable the SVG uses → resolved hex.
+    ///
+    /// BeautifulMermaid's `_resolveSvgCssVariables` partially resolves
+    /// `color-mix()` calls but leaves broken strings like
+    /// `#1F2328 60%, #FFFFFF))` when inner `var()` references were
+    /// substituted before the outer `color-mix()` was evaluated.
+    /// We bypass that entirely by computing all values from the Swift theme.
+    private static func mermaidCSSVars(for colors: MermaidSemanticColors) -> [(key: String, value: String)] {
+        // Longest keys first so --_text-sec is matched before --_text
+        return [
+            ("--_text-sec",    colors.textSec),
+            ("--_text-muted",  colors.textMuted),
+            ("--_text-faint",  colors.textFaint),
+            ("--_node-fill",   colors.nodeFill),
+            ("--_node-stroke", colors.nodeStroke),
+            ("--_group-fill",  colors.groupFill),
+            ("--_group-hdr",   colors.groupHdr),
+            ("--_inner-stroke", colors.innerStroke),
+            ("--_key-badge",   colors.keyBadge),
+            ("--_text",        colors.text),
+            ("--_line",        colors.line),
+            ("--_arrow",       colors.arrow),
+            ("--surface",      colors.surface),
+            ("--border",       colors.border),
+            ("--accent",       colors.accent),
+            ("--muted",        colors.muted),
+            ("--line",         colors.line),
+            ("--bg",           colors.bg),
+            ("--fg",           colors.text),
+        ]
+    }
+
+    /// Rewrite the embedded `<style>` block's `--_…` definitions with concrete
+    /// hex values so WebKit never sees the broken `color-mix()` residue.
+    private static func mermaidFixSvgStyleVars(_ svg: String,
+                                               colors: MermaidSemanticColors) -> String {
+        let defs: [(String, String)] = [
+            ("text-sec", colors.textSec),
+            ("text-muted", colors.textMuted),
+            ("text-faint", colors.textFaint),
+            ("node-fill", colors.nodeFill),
+            ("node-stroke", colors.nodeStroke),
+            ("group-fill", colors.groupFill),
+            ("group-hdr", colors.groupHdr),
+            ("inner-stroke", colors.innerStroke),
+            ("key-badge", colors.keyBadge),
+            ("text", colors.text),
+            ("line", colors.line),
+            ("arrow", colors.arrow),
+        ]
+        var result = svg
+        for (name, hex) in defs {
+            let escaped = NSRegularExpression.escapedPattern(for: "--_\(name)")
+            let pattern = escaped + #"\s*:\s*[^;\n]+"#
+            result = result.replacingOccurrences(
+                of: pattern,
+                with: "--_\(name): \(hex)",
+                options: .regularExpression
+            )
+        }
+        return result
+    }
+
+    /// Replace broken inline `fill` / `stroke` attributes with the right
+    /// semantic colour for each SVG element kind.
+    private static func mermaidFixBrokenInlineColors(_ svg: String,
+                                                     colors: MermaidSemanticColors) -> String {
+        let broken = nativeMermaidBrokenColorValuePattern
+
+        func replaceAttr(in chunk: String, attr: String, color: String) -> String {
+            chunk.replacingOccurrences(
+                of: attr + #"="\#(broken)""#,
+                with: attr + "=\"\(color)\"",
+                options: .regularExpression
+            )
+        }
+
+        func rewriteChunks(in source: String,
+                           matching pattern: String,
+                           transform: (String) -> String) -> String {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { return source }
+            let ns = source as NSString
+            let matches = regex.matches(in: source, range: NSRange(location: 0, length: ns.length))
+            guard !matches.isEmpty else { return source }
+            var result = source
+            for match in matches.reversed() {
+                let chunk = ns.substring(with: match.range)
+                let fixed = transform(chunk)
+                result = (result as NSString).replacingCharacters(in: match.range, with: fixed)
+            }
+            return result
+        }
+
+        var result = svg
+        result = rewriteChunks(in: result, matching: #"<g class="node"[\s\S]*?</g>"#) { chunk in
+            var fixed = replaceAttr(in: chunk, attr: "fill", color: colors.nodeFill)
+            fixed = replaceAttr(in: fixed, attr: "stroke", color: colors.nodeStroke)
+            return fixed
+        }
+        result = rewriteChunks(in: result, matching: #"<polyline class="edge"[^>]*/>"#) { chunk in
+            replaceAttr(in: chunk, attr: "stroke", color: colors.line)
+        }
+        result = rewriteChunks(in: result, matching: #"<polygon[^>]*/>"#) { chunk in
+            var fixed = replaceAttr(in: chunk, attr: "fill", color: colors.arrow)
+            fixed = replaceAttr(in: fixed, attr: "stroke", color: colors.arrow)
+            return fixed
+        }
+        result = rewriteChunks(in: result, matching: #"<g class="subgraph"[\s\S]*?</g>"#) { chunk in
+            replaceAttr(in: chunk, attr: "stroke", color: colors.nodeStroke)
+        }
+        result = rewriteChunks(in: result, matching: #"<text[^>]*>[\s\S]*?</text>"#) { chunk in
+            replaceAttr(in: chunk, attr: "fill", color: colors.textSec)
+        }
+        return result
+    }
+
+    /// Last-resort scrub for any colour literal WebKit still can't parse.
+    private static func mermaidStripResidualBrokenColors(_ svg: String) -> String {
+        var result = svg
+        result = result.replacingOccurrences(
+            of: #"color-mix\([^)]+\)"#,
+            with: "#666666",
+            options: .regularExpression
+        )
+        result = nativeMermaidMalformedColorRegex.stringByReplacingMatches(
+            in: result,
+            range: NSRange(location: 0, length: (result as NSString).length),
+            withTemplate: "#666666"
+        )
+        return result
+    }
+
+    /// Replace every `var(--xxx)` reference in `svg` with its resolved hex.
+    private static func mermaidFlattenCSSVars(_ svg: String,
+                                              vars: [(key: String, value: String)]) -> String {
+        var result = svg
+        for (key, value) in vars {
+            let escaped = NSRegularExpression.escapedPattern(for: key)
+            let pattern = #"var\(\s*"# + escaped + #"\s*(?:,[^)]+)?\)"#
+            result = result.replacingOccurrences(of: pattern, with: value, options: .regularExpression)
+        }
+        return result
+    }
+
+    private static func normalizeNativeMermaidSVG(_ svg: String, theme: DiagramTheme) -> String {
+        var result = svg
+
+        // 1. Strip Google Fonts @import (offline / sandboxed)
+        result = result.replacingOccurrences(
+            of: #"@import[^\n]*\n"#,
+            with: "",
+            options: .regularExpression
+        )
+
+        // 2. Replace Inter font with Apple system font
+        result = result.replacingOccurrences(
+            of: #"font-family:\s*'Inter',\s*system-ui,\s*sans-serif"#,
+            with: #"font-family: -apple-system, BlinkMacSystemFont, \"SF Pro Text\", system-ui, sans-serif"#,
+            options: .regularExpression
+        )
+
+        // 3. Resolve all CSS variables to concrete hex values, then repair
+        //    broken inline fills/strokes BeautifulMermaid's partial resolver
+        //    can leave behind. Use semantic colours — never the foreground
+        //    fallback that turned every node into a solid black slab.
+        let colors = mermaidSemanticColors(darkMode: true)
+        result = mermaidFixSvgStyleVars(result, colors: colors)
+        result = mermaidFlattenCSSVars(result, vars: mermaidCSSVars(for: colors))
+        result = mermaidFixBrokenInlineColors(result, colors: colors)
+        result = mermaidStripResidualBrokenColors(result)
+
+        // 4. Rewrite the root <svg> tag: remove fixed width/height, inject
+        //    responsive layout style, force transparent background.
+        guard let match = nativeMermaidSVGTagRegex.firstMatch(
+            in: result,
+            range: NSRange(location: 0, length: (result as NSString).length)
+        ) else {
+            return result
+        }
+
+        let nsResult = result as NSString
+        var svgTag = nsResult.substring(with: match.range)
+        svgTag = svgTag.replacingOccurrences(
+            of: #"\swidth=\"[^\"]*\""#,
+            with: "",
+            options: .regularExpression
+        )
+        svgTag = svgTag.replacingOccurrences(
+            of: #"\sheight=\"[^\"]*\""#,
+            with: "",
+            options: .regularExpression
+        )
+
+        if svgTag.contains("style=") {
+            svgTag = svgTag.replacingOccurrences(
+                of: #"style=\""#,
+                with: #"style=\"display:block;width:auto;height:auto;max-width:100%;max-height:calc(min(70vh,720px) - 32px);margin:0 auto;"#,
+                options: .regularExpression
+            )
+            svgTag = svgTag.replacingOccurrences(
+                of: #"background:[^;\"]*;?"#,
+                with: "background:transparent;",
+                options: .regularExpression
+            )
+        } else {
+            svgTag = svgTag.replacingOccurrences(
+                of: ">",
+                with: #" style=\"display:block;width:auto;height:auto;max-width:100%;max-height:calc(min(70vh,720px) - 32px);margin:0 auto;\">"#
+            )
+        }
+
+        if !svgTag.contains("preserveAspectRatio=") {
+            svgTag = svgTag.replacingOccurrences(
+                of: ">",
+                with: " preserveAspectRatio=\"xMinYMin meet\">"
+            )
+        }
+
+        return nsResult.replacingCharacters(in: match.range, with: svgTag)
+    }
+
+#endif // canImport(BeautifulMermaid)
+
+    private static func shouldRenderNativeMermaid(_ source: String) -> Bool {
+        let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let firstLine = trimmed.split(separator: "\n", omittingEmptySubsequences: false).first else {
+            return false
+        }
+        let line = String(firstLine).trimmingCharacters(in: .whitespaces)
+        let sourceRange = NSRange(location: 0, length: (source as NSString).length)
+        guard nativeMermaidMultilineLabelRegex.firstMatch(in: source, range: sourceRange) == nil else {
+            return false
+        }
+        return nativeMermaidDiagramPrefixes.contains { prefix in
+            line.hasPrefix(prefix)
+        }
+    }
+
+    private static func renderNativeMermaidBlocks(in html: String,
+                                                  darkMode: Bool) -> NativeMermaidRenderResult {
+#if canImport(BeautifulMermaid)
+        guard html.contains("language-mermaid") else {
+            return NativeMermaidRenderResult(html: html, containsNativeMermaid: false)
+        }
+        var renderedAny = false
+        let rendered = replaceMatches(of: mermaidRegex, in: html) { diagram in
+            let source = htmlUnescape(diagram)
+            guard shouldRenderNativeMermaid(source) else {
+                // Leave untouched for the JS mermaid fallback.
+                return nil
+            }
+            let theme = mermaidTheme(darkMode: darkMode)
+            do {
+                let svg = try MermaidRenderer.renderSVG(source: source, theme: theme)
+                let normalizedSVG = normalizeNativeMermaidSVG(svg, theme: theme)
+                renderedAny = true
+                return """
+                <figure class="mermaid-figure native-mermaid" tabindex="0" role="img" aria-label="Mermaid diagram">
+                <div class="mermaid-stage"><div class="mermaid-native">
+                \(normalizedSVG)
+                </div></div>
+                </figure>
+                """
+            } catch {
+                // Parsing/rendering failed for a supported-looking diagram;
+                // leave the original block for the JS fallback so the user
+                // still sees *some* rendered output when possible.
+                return nil
+            }
+        }
+        return NativeMermaidRenderResult(html: rendered, containsNativeMermaid: renderedAny)
+#else
+        return NativeMermaidRenderResult(html: html, containsNativeMermaid: false)
+#endif
+    }
 
     private static func renderMermaidBlocks(in html: String) -> MermaidRenderResult {
         guard html.contains("language-mermaid") else {
@@ -1905,11 +2346,26 @@ nonisolated enum MarkdownHTML {
     .mermaid-figure:focus-visible {
         box-shadow: 0 0 0 3px color-mix(in srgb, AccentColor 60%, transparent);
     }
+    .mermaid-figure.native-mermaid {
+        aspect-ratio: auto;
+        height: auto;
+        contain: layout;
+        background: #0d1117;
+        max-height: min(70vh, 720px);
+        overflow: hidden;
+    }
     .mermaid-stage {
         position: absolute;
         inset: 0;
         overflow: hidden;
         contain: strict;
+    }
+    .mermaid-figure.native-mermaid .mermaid-stage {
+        position: relative;
+        display: block;
+        overflow: auto;
+        contain: layout paint;
+        max-height: min(70vh, 720px);
     }
     .mermaid-figure .mermaid-stage { cursor: grab; }
     .mermaid-figure .mermaid-stage:active { cursor: grabbing; }
@@ -1923,6 +2379,22 @@ nonisolated enum MarkdownHTML {
         display: block;
         width: 100%;
         height: 100%;
+    }
+    .mermaid-native {
+        display: block;
+        width: 100%;
+        padding: 16px;
+        box-sizing: border-box;
+        background: transparent;
+    }
+    .mermaid-native svg {
+        display: block;
+        width: auto;
+        height: auto;
+        max-width: 100%;
+        max-height: calc(min(70vh, 720px) - 32px);
+        margin: 0 auto;
+        background: transparent !important;
     }
     .mermaid-hud {
         position: absolute;

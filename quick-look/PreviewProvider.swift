@@ -13,7 +13,9 @@ class PreviewProvider: QLPreviewProvider, QLPreviewingController {
 
     func providePreview(for request: QLFilePreviewRequest) async throws -> QLPreviewReply {
         let text = try String(contentsOf: request.fileURL, encoding: .utf8)
-        let renderedHTML = MarkdownHTML.makeHTML(from: text, allowsScroll: true)
+        let renderedHTML = MarkdownHTML.makeHTML(from: text,
+                                                  allowsScroll: true,
+                                                  darkMode: false)
         let baseDirectory = request.fileURL.deletingLastPathComponent()
         let rewrite = InlineLocalAssets.rewriteRelativeImages(
             html: renderedHTML,

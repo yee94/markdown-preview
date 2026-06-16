@@ -17,6 +17,10 @@ let package = Package(
             url: "https://github.com/swiftlang/swift-markdown.git",
             from: "0.7.3"
         ),
+        .package(
+            url: "https://github.com/lukilabs/beautiful-mermaid-swift",
+            from: "1.0.0"
+        ),
     ],
     targets: [
         .target(name: "QuickLookHelpers"),
@@ -28,6 +32,11 @@ let package = Package(
             name: "MarkdownHelpers",
             dependencies: [
                 .product(name: "Markdown", package: "swift-markdown"),
+                .product(name: "BeautifulMermaid", package: "beautiful-mermaid-swift"),
+            ],
+            linkerSettings: [
+                .linkedFramework("WebKit"),
+                .linkedFramework("AppKit"),
             ]
         ),
         .testTarget(

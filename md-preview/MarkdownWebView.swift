@@ -50,6 +50,13 @@ final class MarkdownWebView: NSView, WKNavigationDelegate {
     }
     private var loadedFingerprint: RendererFingerprint?
     private var isPageReady = false
+
+    private var isDarkAppearance: Bool {
+        if #available(macOS 10.14, *) {
+            return effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        }
+        return false
+    }
     // Bumped on every display() call so a slower render finishing after a
     // newer one is dropped instead of clobbering the latest article.
     private var renderGeneration: UInt64 = 0
@@ -135,6 +142,11 @@ final class MarkdownWebView: NSView, WKNavigationDelegate {
     graph TD; A-->B
     ```
 
+    ```mermaid
+    gitGraph
+       commit
+    ```
+
     ```typescript
     let x: string = 'warmup';
     ```
@@ -142,13 +154,15 @@ final class MarkdownWebView: NSView, WKNavigationDelegate {
 
     private func warmupVendors() {
         guard !isPageReady, loadedFingerprint == nil else { return }
-        let baseHref = "\(MarkdownAssetScheme.scheme):///"
+        let baseHref = "\(MarkdownAssetScheme.scheme):\\/\\/\\/"
         let markdown = Self.warmupMarkdown
+        let darkMode = isDarkAppearance
         Task { @concurrent [weak self] in
             let rendered = Self.timedRender(label: "warmup",
                                             markdown: markdown,
                                             assetBaseHref: baseHref,
-                                            warmup: true)
+                                            warmup: true,
+                                            darkMode: darkMode)
             await self?.applyWarmup(rendered)
         }
     }
@@ -257,10 +271,12 @@ final class MarkdownWebView: NSView, WKNavigationDelegate {
             "generation": generation,
             "ready": isPageReady
         ])
+        let darkMode = isDarkAppearance
         Task { @concurrent [weak self] in
             let rendered = Self.timedRender(label: "display",
                                             markdown: markdown,
-                                            assetBaseHref: baseHref)
+                                            assetBaseHref: baseHref,
+                                            darkMode: darkMode)
             await self?.applyDisplay(rendered,
                                      generation: generation,
                                      selectionID: selectionID,
@@ -275,12 +291,14 @@ final class MarkdownWebView: NSView, WKNavigationDelegate {
     private nonisolated static func timedRender(label: String,
                                                 markdown: String,
                                                 assetBaseHref: String,
-                                                warmup: Bool = false) -> MarkdownHTML.RenderedHTML {
+                                                warmup: Bool = false,
+                                                darkMode: Bool = false) -> MarkdownHTML.RenderedHTML {
         let t0 = DispatchTime.now()
         let rendered = MarkdownHTML.render(markdown: markdown,
                                            assetBaseHref: assetBaseHref,
                                            vendorLoading: .lazy,
-                                           warmup: warmup)
+                                           warmup: warmup,
+                                           darkMode: darkMode)
         let elapsedMs = Int(
             (Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds)
              / 1_000_000).rounded()
