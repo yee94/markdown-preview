@@ -10,6 +10,10 @@ final class MainSplitViewController: NSSplitViewController {
     private static let didSeedKey = "MainSplitView.didSeedInitialState"
 
     var onSelectFile: ((URL, String) -> Void)?
+    var mermaidFullscreenRequested: ((String) -> Void)? {
+        get { previewViewController.mermaidFullscreenRequested }
+        set { previewViewController.mermaidFullscreenRequested = newValue }
+    }
 
     private let previewViewController = ContentViewController()
 

@@ -52,6 +52,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
     private var searchMode: SearchMode = .contains
     private var pendingFindWork: DispatchWorkItem?
     private static let findDebounceDelay: TimeInterval = 0.10
+    private let mermaidFullscreenOverlay = MermaidFullscreenOverlayController()
 
     private var documentWindow: NSWindow {
         guard let window else {
@@ -89,6 +90,10 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
         split.onSelectFile = { [weak self] url, source in
             self?.present(url: url, source: source)
         }
+        split.mermaidFullscreenRequested = { [weak self] svg in
+            guard let self, let window = self.window else { return }
+            self.mermaidFullscreenOverlay.present(svg: svg, in: window)
+        }
         documentWindow.contentViewController = split
         documentWindow.setContentSize(NSSize(width: 1100, height: 720))
         documentWindow.center()
@@ -105,6 +110,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
     }
 
     func windowWillClose(_ notification: Notification) {
+        mermaidFullscreenOverlay.dismiss()
         fileWatcher?.cancel()
         fileWatcher = nil
         DispatchQueue.main.async {
@@ -138,6 +144,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTo
     }
 
     func display(markdown: String, fileURL: URL?) {
+        mermaidFullscreenOverlay.dismiss()
         let selectionID = beginSelection(url: fileURL, source: "document.display")
         currentFileURL = fileURL
         currentMarkdown = markdown

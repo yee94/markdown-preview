@@ -1023,6 +1023,7 @@ nonisolated enum MarkdownHTML {
             }
             if (articleHTML) {
                 decorateCodeBlocks();
+                wireMermaidFullscreen();
                 for (const fn of reappliers) {
                     try { fn(); } catch (e) { /* one bad apple shouldn't block others */ }
                 }
@@ -1044,10 +1045,31 @@ nonisolated enum MarkdownHTML {
             tmpl.remove();
         }
 
+        // Native fullscreen for Mermaid figures. Click posts SVG to the AppKit
+        // host, which presents a window-level overlay (sidebar + preview).
+        let mermaidFullscreenWired = false;
+
+        function wireMermaidFullscreen() {
+            if (mermaidFullscreenWired) return;
+            mermaidFullscreenWired = true;
+            document.addEventListener('click', (event) => {
+                const figure = event.target.closest('.mermaid-figure.native-mermaid');
+                if (!figure || figure.classList.contains('mermaid-error')) return;
+                if (event.target.closest('a, button')) return;
+                const svg = figure.querySelector('svg');
+                if (!svg) return;
+                if (post({ kind: 'mermaidFullscreen', svg: svg.outerHTML })) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                }
+            });
+        }
+
         function start() {
             perfLog('start (DOM ready)');
             populateFromTemplate();
             decorateCodeBlocks();
+            wireMermaidFullscreen();
             pushHeight();
             try {
                 const ro = new ResizeObserver(pushHeight);
@@ -2366,6 +2388,10 @@ nonisolated enum MarkdownHTML {
         overflow: auto;
         contain: layout paint;
         max-height: min(70vh, 720px);
+        cursor: zoom-in;
+    }
+    .mermaid-figure.native-mermaid .mermaid-stage:active {
+        cursor: zoom-in;
     }
     .mermaid-figure .mermaid-stage { cursor: grab; }
     .mermaid-figure .mermaid-stage:active { cursor: grabbing; }

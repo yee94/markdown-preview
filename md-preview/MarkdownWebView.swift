@@ -31,6 +31,7 @@ final class MarkdownWebView: NSView, WKNavigationDelegate {
     let webView: WKWebView
     var heightDidChange: ((CGFloat) -> Void)?
     var fragmentLinkActivated: ((String) -> Void)?
+    var mermaidFullscreenRequested: ((String) -> Void)?
     private let assetScheme = MarkdownAssetScheme()
     private var currentAssetBase: URL?
     private let messageBridge = HostBridge()
@@ -438,6 +439,9 @@ final class MarkdownWebView: NSView, WKNavigationDelegate {
             let pasteboard = NSPasteboard.general
             pasteboard.clearContents()
             pasteboard.setString(text, forType: .string)
+        case "mermaidFullscreen":
+            guard let svg = dict["svg"] as? String else { return }
+            mermaidFullscreenRequested?(svg)
         case "scroll":
             guard let value = dict["value"] as? String else { return }
             switch value {
